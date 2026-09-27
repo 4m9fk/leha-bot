@@ -8,7 +8,13 @@ on:
     - cron: "0 7 * * *"   # 10:00 по Минску: крайний срок — если ещё ничего не ушло, шлём что есть
   push:
     branches: [claude/shared]  # routine запушила выпуск: после 08:00 и если сегодня ещё не слали — рассылаем
-  workflow_dispatch:           # вручную — рассылка всегда
+  workflow_dispatch:           # вручную: sync — только подхватить входящие, force — разослать сейчас
+    inputs:
+      mode:
+        description: "sync — подхватить подписки, имена и /interests; force — разослать подборку сейчас"
+        type: choice
+        options: [sync, force]
+        default: sync
 
 permissions:
   contents: write  # чтобы закоммитить state.json
@@ -25,7 +31,7 @@ jobs:
       # режим для digest.py; cron-выражения здесь и в on.schedule должны совпадать
       MODE: >-
         ${{ github.event_name == 'push' && 'push'
-          || github.event_name == 'workflow_dispatch' && 'force'
+          || github.event_name == 'workflow_dispatch' && inputs.mode
           || github.event.schedule == '17 * * * *' && 'sync'
           || github.event.schedule == '0 5 * * *' && 'morning'
           || 'deadline' }}

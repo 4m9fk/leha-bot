@@ -61,7 +61,8 @@ python3 -c "import secrets; print(secrets.token_urlsafe(12))"
 Нажми **Run now** и проверь, что в репозитории появилась ветка `claude/shared` с файлом `digest.json`.
 
 ### 5. Проверь
-Вкладка **Actions** → *Daily digest* → **Run workflow**. Через 1–3 минуты придёт сообщение.
+Вкладка **Actions** → *Daily digest* → **Run workflow**, режим `force`. Через 1–3 минуты придёт сообщение.
+(Режим `sync`, по умолчанию, только подхватывает подписки, имена и `/interests` без рассылки.)
 Дальше — автоматически каждый день в 08:00 по Минску.
 
 ## Настройка под себя — `config.json`
