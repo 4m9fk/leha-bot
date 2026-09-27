@@ -217,12 +217,14 @@ def build_prompt(cfg: dict, name: str, weather: str) -> str:
 def generate_digest(cfg: dict, name: str) -> str:
     client = anthropic.Anthropic()
     messages = [{"role": "user", "content": build_prompt(cfg, name, get_weather(cfg))}]
+    location = {"type": "approximate", "city": cfg["city"], "timezone": cfg["timezone"]}
+    if cfg.get("country"):  # веб-поиск поддерживает не все страны (например, BY — нет)
+        location["country"] = cfg["country"]
     tools = [{
         "type": "web_search_20250305",
         "name": "web_search",
         "max_uses": cfg["max_searches"],
-        "user_location": {"type": "approximate", "city": cfg["city"],
-                          "country": cfg["country"], "timezone": cfg["timezone"]},
+        "user_location": location,
     }]
     for _ in range(5):  # длинный поиск может прийти с stop_reason=pause_turn — продолжаем
         resp = client.messages.create(model=cfg["model"], max_tokens=8000,
