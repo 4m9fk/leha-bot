@@ -112,7 +112,8 @@ def send(chat_id: str, text: str, html_mode: bool = False) -> None:
     if DRY_RUN:
         print(text, "\n" + "-" * 40)
         return
-    for part in split_message(text):
+    # лимит Telegram считается по тексту после разбора разметки — теги и адреса ссылок не в счёт
+    for part in split_message(text, measure=(lambda t: len(strip_html(t))) if html_mode else len):
         # ранний синхронизирующий запуск идёт ночью — отвечаем без звука
         params = dict(chat_id=chat_id, disable_web_page_preview=True, disable_notification=SYNC_ONLY)
         if not html_mode:
@@ -139,17 +140,18 @@ def send_photo(chat_id: str, path: Path, caption: str = "") -> None:
         tg("sendPhoto", files={"photo": f}, chat_id=chat_id, caption=caption[:1024])
 
 
-def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
+def split_message(text: str, limit: int = TG_LIMIT, measure=len) -> list[str]:
     """Режет по разделам (абзацам через пустую строку), чтобы не разрывать HTML-теги;
-    раздел длиннее лимита — по строкам, а строку длиннее лимита — как есть кусками."""
+    раздел длиннее лимита — по строкам, а строку длиннее лимита — как есть кусками.
+    measure — как считать длину (для HTML — видимый текст без тегов)."""
     parts, current = [], ""
     for block in text.split("\n\n"):
-        pieces = [block] if len(block) <= limit else block.splitlines()
+        pieces = [block] if measure(block) <= limit else block.splitlines()
         for piece in pieces:
-            while len(piece) > limit:
+            while measure(piece) > limit:
                 parts.append(piece[:limit]); piece = piece[limit:]
             sep = "\n\n" if piece is block else "\n"
-            if current and len(current) + len(sep) + len(piece) > limit:
+            if current and measure(current + sep + piece) > limit:
                 parts.append(current); current = ""
             current = f"{current}{sep}{piece}" if current else piece
     if current.strip():
