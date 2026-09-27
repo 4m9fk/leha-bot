@@ -2,7 +2,8 @@ name: Daily digest
 
 on:
   schedule:
-    - cron: "0 5 * * *"  # 08:00 по Минску (UTC+3)
+    - cron: "30 2 * * *"  # 05:30 по Минску: только обработать входящие, чтобы routine видела свежий state.json
+    - cron: "0 5 * * *"   # 08:00 по Минску: рассылка
   workflow_dispatch:
 
 permissions:
@@ -15,7 +16,7 @@ concurrency:
 jobs:
   digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 25  # до 10 минут ожидания имени + генерация с веб-поиском
+    timeout-minutes: 20  # до 10 минут ожидания имени
     steps:
       - uses: actions/checkout@v4
 
@@ -26,9 +27,17 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Fetch digest texts
+        # тексты кладёт routine Claude Code в ветку claude/shared; нет их — уйдут приветствие, погода и курсы
+        if: github.event.schedule != '30 2 * * *'
+        run: |
+          (git fetch --depth 1 origin claude/shared && git show FETCH_HEAD:digest.json > digest.json) \
+            || { rm -f digest.json; echo "digest.json в ветке claude/shared нет"; }
+          for f in meme.jpg meme.png; do git show "FETCH_HEAD:$f" > "$f" 2>/dev/null || rm -f "$f"; done
+
       - name: Send digest
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SYNC_ONLY: ${{ github.event.schedule == '30 2 * * *' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           INVITE_CODE: ${{ secrets.INVITE_CODE }}

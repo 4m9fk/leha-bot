@@ -1,36 +1,51 @@
-"""Ежедневная подборка: шутка, погода, новости и мероприятия города, комплимент.
+"""Ежедневная подборка: шутка, погода, курсы, новости, быт, афиша, кино, комплимент — плюс карточка-инфографика
+и мем дня.
+
+Все тексты заранее пишет routine в Claude Code по routine.md (из подписки, без API): общую часть
+и личные приветствие, шутку, «для тебя» и комплимент для каждого получателя из state.json.
+Результат — digest.json в ветке claude/shared; workflow подкладывает его рядом со скриптом.
+Этот скрипт только добавляет погоду (Open-Meteo) и курсы (НБРБ), рисует карточку и рассылает.
+Если digest.json за сегодня нет — уходит приветствие, погода и курсы.
 
 Переменные окружения:
-  ANTHROPIC_API_KEY   ключ с console.anthropic.com
   TELEGRAM_BOT_TOKEN  токен от @BotFather
   INVITE_CODE         секретный код для ссылки-приглашения t.me/<бот>?start=<код>
   TELEGRAM_CHAT_ID    (необязательно) chat_id, который подписан сразу, без приглашения
-  DRY_RUN=1           (необязательно) напечатать подборку, а не отправлять
+  SYNC_ONLY=true      (необязательно) только обработать входящие (имена, /name, /interests) и выйти —
+                      ранний запуск перед routine, чтобы она видела свежий state.json
+  DRY_RUN=1           (необязательно) напечатать подборку и сохранить card.png, а не отправлять
 
-Получатели и их имена хранятся в state.json (workflow коммитит его обратно в репозиторий).
-Подписаться: открыть ссылку-приглашение и нажать Start — бот спросит имя при следующем запуске.
-Сменить имя: написать боту «/name Новое имя» — применится при следующем запуске.
+Получатели, имена и интересы хранятся в state.json (workflow коммитит его обратно в репозиторий).
+Подписаться: открыть ссылку-приглашение и нажать Start. Команды: /name Имя, /interests кино, спорт.
 """
 
 import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import anthropic
 import requests
 
 ROOT = Path(__file__).parent
 CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 STATE_FILE = ROOT / "state.json"
+DIGEST_FILE = ROOT / "digest.json"  # пишет routine, см. routine.md
+CARD_FILE = ROOT / "card.png"
+MEME_FILES = [ROOT / "meme.jpg", ROOT / "meme.png"]  # картинку мема routine кладёт рядом с digest.json
+PHOTO_TYPES = {"image/jpeg": ".jpg", "image/png": ".png"}
+PHOTO_MAX_BYTES = 10_000_000  # лимит Telegram на фото
 TG_LIMIT = 4000  # у Telegram лимит 4096 символов на сообщение
 DRY_RUN = bool(os.getenv("DRY_RUN"))
+SYNC_ONLY = os.getenv("SYNC_ONLY") == "true"
 INVITE_CODE = os.getenv("INVITE_CODE", "").strip()
 RAIN_PROBABILITY = 40  # %, с какой вероятности осадков считать час дождливым
+CURRENCIES = ("USD", "EUR", "RUB")
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
+          "июля", "августа", "сентября", "октября", "ноября", "декабря"]
 
 WMO = {0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность", 3: "пасмурно",
        45: "туман", 48: "изморозь", 51: "слабая морось", 53: "морось", 55: "сильная морось",
@@ -40,10 +55,14 @@ WMO = {0: "ясно", 1: "преимущественно ясно", 2: "пере
        95: "гроза", 96: "гроза с градом", 99: "гроза с сильным градом"}
 
 
+def today(cfg: dict) -> date:
+    return datetime.now(ZoneInfo(cfg["timezone"])).date()
+
+
 # ---------- состояние ----------
 
 def load_state() -> dict:
-    """state.json: {"users": {chat_id: {"name": ..., "awaiting_name": ...}}}."""
+    """state.json: {"users": {chat_id: {"name", "awaiting_name", "interests"}}}."""
     state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
     users = state.setdefault("users", {})
     owner = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -63,10 +82,12 @@ def save_state(state: dict) -> None:
 
 # ---------- Telegram ----------
 
-def tg(method: str, **params) -> dict:
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    r = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=params,
-                      timeout=params.get("timeout", 0) + 30)
+def tg(method: str, files: dict | None = None, **params) -> dict:
+    url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{method}"
+    if files:  # загрузка файла — multipart
+        r = requests.post(url, data=params, files=files, timeout=120)
+    else:
+        r = requests.post(url, json=params, timeout=params.get("timeout", 0) + 30)
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram {method}: {data}")
@@ -78,7 +99,17 @@ def send(chat_id: str, text: str) -> None:
         print(text, "\n" + "-" * 40)
         return
     for part in split_message(text):
-        tg("sendMessage", chat_id=chat_id, text=part, disable_web_page_preview=True)
+        # ранний синхронизирующий запуск идёт ночью — отвечаем без звука
+        tg("sendMessage", chat_id=chat_id, text=part, disable_web_page_preview=True,
+           disable_notification=SYNC_ONLY)
+
+
+def send_photo(chat_id: str, path: Path, caption: str = "") -> None:
+    if DRY_RUN:
+        print(f"[фото: {path}] {caption}")
+        return
+    with path.open("rb") as f:
+        tg("sendPhoto", files={"photo": f}, chat_id=chat_id, caption=caption[:1024])
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -130,20 +161,27 @@ def handle_messages(messages: list[tuple[str, str]], state: dict, asked: set[str
                 send(chat_id, f"Запомнил: теперь ты для меня {user['name']} 😊")
             else:
                 user.pop("name", None)
+        elif text.startswith("/interests"):
+            new = text[len("/interests"):].strip()
+            if new:
+                user["interests"] = new[:300]
+                send(chat_id, f"Запомнил интересы: {user['interests']} 🎯\n"
+                              "В подборке появится раздел «Для тебя». Сбросить — /interests без текста.")
+            else:
+                user.pop("interests", None)
+                send(chat_id, "Интересы сброшены.")
         elif text.startswith("/"):
             continue  # /start и прочие команды
         elif user.get("awaiting_name") and not user.get("name"):
             user["name"] = text[:50]
             user["awaiting_name"] = False
             send(chat_id, f"Приятно познакомиться, {user['name']}! 🤗 "
-                          f"Теперь каждое утро буду присылать тебе подборку. "
-                          f"Если захочешь сменить имя — напиши /name и новое имя.")
+                          "Теперь каждое утро буду присылать тебе подборку.\n"
+                          "Сменить имя — /name и новое имя. Расскажи, что тебе интересно, — "
+                          "например, /interests кино, концерты, спорт — и я буду подбирать это отдельно.")
 
 
 def ensure_names(state: dict) -> None:
-    if DRY_RUN:
-        state["users"] = {"dry-run": {"name": "Друг"}}
-        return
     users, asked = state["users"], set()
     messages, offset = fetch_messages(None)
     handle_messages(messages, state, asked)
@@ -151,9 +189,9 @@ def ensure_names(state: dict) -> None:
         if not user.get("name") and not user.get("awaiting_name"):
             ask_name(chat_id, user, asked)
 
-    # ждём ответа только от тех, у кого спросили имя в этом запуске;
+    # ждём ответа только от тех, у кого спросили имя в этом запуске (и не в ночной синхронизации);
     # ответ на старый вопрос подхватится при следующем запуске
-    deadline = time.time() + CONFIG["name_wait_minutes"] * 60
+    deadline = time.time() + (0 if SYNC_ONLY else CONFIG["name_wait_minutes"] * 60)
     while any(not users[c].get("name") for c in asked) and time.time() < deadline:
         messages, offset = fetch_messages(offset, timeout=50)
         handle_messages(messages, state, asked)
@@ -163,7 +201,20 @@ def ensure_names(state: dict) -> None:
     save_state(state)
 
 
-# ---------- погода (Open-Meteo, без ключа) ----------
+# ---------- погода (Open-Meteo) и курсы (НБРБ), без ключей ----------
+
+def get_hourly(cfg: dict) -> dict | None:
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast", timeout=20, params={
+            "latitude": cfg["latitude"], "longitude": cfg["longitude"], "timezone": cfg["timezone"],
+            "hourly": "temperature_2m,precipitation_probability,precipitation,weather_code",
+            "forecast_days": 1})
+        r.raise_for_status()
+        return r.json()["hourly"]
+    except (requests.RequestException, KeyError, ValueError) as e:
+        print(f"Погоду получить не удалось: {e}", file=sys.stderr)
+        return None
+
 
 def rain_windows(h: dict) -> list[str]:
     """Интервалы с 6 до 24 часов, когда вероятны осадки, например «14:00–17:00 дождь (до 80%)»."""
@@ -183,171 +234,220 @@ def rain_windows(h: dict) -> list[str]:
     return result
 
 
-def get_weather(cfg: dict) -> str:
-    try:
-        r = requests.get("https://api.open-meteo.com/v1/forecast", timeout=20, params={
-            "latitude": cfg["latitude"], "longitude": cfg["longitude"], "timezone": cfg["timezone"],
-            "hourly": "temperature_2m,precipitation_probability,precipitation,weather_code",
-            "daily": "temperature_2m_min,temperature_2m_max",
-            "forecast_days": 1})
+def weather_section(h: dict) -> str:
+    t = h["temperature_2m"]
+    return "\n".join(["🌤 Погода", f"Утром {t[8]:.0f}°C, днём {t[13]:.0f}°C, вечером {t[18]:.0f}°C"]
+                     + ([f"☔ {w}" for w in rain_windows(h)] or ["Без осадков"]))
+
+
+def get_rates() -> list[dict]:
+    """Официальные курсы НБРБ на сегодня и изменение ко вчера: [{code, scale, rate, delta}]."""
+    def fetch(ondate: str | None = None) -> dict:
+        params = {"periodicity": 0, **({"ondate": ondate} if ondate else {})}
+        r = requests.get("https://api.nbrb.by/exrates/rates", params=params, timeout=20)
         r.raise_for_status()
-        d = r.json()
-        h, day = d["hourly"], d["daily"]
-        temps = ", ".join(f"{i:02d}:00 {h['temperature_2m'][i]:.0f}°C" for i in (8, 13, 18))
-        rain = rain_windows(h)
-        return (f"Температура: от {day['temperature_2m_min'][0]:.0f} до {day['temperature_2m_max'][0]:.0f}°C "
-                f"({temps}).\n"
-                + (f"Осадки: {'; '.join(rain)}." if rain else "Осадков не ожидается."))
-    except Exception as e:
-        return f"(данные о погоде получить не удалось: {e} — найди прогноз через веб-поиск)"
+        return {x["Cur_Abbreviation"]: x for x in r.json()}
+    try:
+        now = fetch()
+    except (requests.RequestException, KeyError, ValueError) as e:
+        print(f"Курсы получить не удалось: {e}", file=sys.stderr)
+        return []
+    try:
+        some_day = datetime.fromisoformat(next(iter(now.values()))["Date"]).date()
+        before = fetch((some_day - timedelta(days=1)).isoformat())
+    except (requests.RequestException, KeyError, ValueError, StopIteration):
+        before = {}
+    return [{"code": c, "scale": now[c]["Cur_Scale"], "rate": now[c]["Cur_OfficialRate"],
+             "delta": now[c]["Cur_OfficialRate"] - before[c]["Cur_OfficialRate"] if c in before else None}
+            for c in CURRENCIES if c in now]
+
+
+def rates_section(rates: list[dict]) -> str:
+    def fmt(r: dict) -> str:
+        arrow = "" if not r["delta"] else (" ▲" if r["delta"] > 0 else " ▼")
+        return f"{'' if r['scale'] == 1 else r['scale']} {r['code']}".strip() + f" {r['rate']:.4f}{arrow}"
+    return "💱 Курсы НБРБ, BYN\n" + " · ".join(fmt(r) for r in rates)
+
+
+# ---------- карточка-инфографика ----------
+
+# цвета — эталонная палитра dataviz (светлая тема); температура и дождь — два отдельных графика
+# с общей осью часов, а не один с двумя осями Y
+SURFACE, INK, INK_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e5e0"
+TEMP_COLOR, RAIN_COLOR = "#eb6834", "#2a78d6"
+
+
+def render_card(cfg: dict, h: dict | None, rates: list[dict], highlights: list[dict], path: Path) -> bool:
+    """Рисует PNG 1080×1350: заголовок, температура и дождь по часам, курсы, главное сегодня."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    d = today(cfg)
+    fig = plt.figure(figsize=(7.2, 9), dpi=150, facecolor=SURFACE)
+    plt.rcParams.update({"font.family": "DejaVu Sans"})  # встроен в matplotlib, есть кириллица
+    fig.text(0.07, 0.945, cfg["city"], fontsize=26, fontweight="bold", color=INK, va="top")
+    fig.text(0.07, 0.895, f"{WEEKDAYS[d.weekday()].capitalize()}, {d.day} {MONTHS[d.month - 1]}",
+             fontsize=13, color=INK_2, va="top")
+
+    top = 0.84
+    if h:
+        hours = list(range(6, 24))
+        temps = [h["temperature_2m"][i] for i in hours]
+        rain = [h["precipitation_probability"][i] for i in hours]
+        lo, hi = min(temps), max(temps)
+        fig.text(0.07, top, f"{lo:.0f}° … {hi:.0f}°", fontsize=30, fontweight="bold", color=INK, va="top")
+        windows = rain_windows(h)
+        fig.text(0.07, top - 0.06, shorten("Осадки: " + "; ".join(windows), 70) if windows else "Без осадков",
+                 fontsize=11, color=INK_2, va="top")
+
+        ax_t = fig.add_axes([0.1, 0.56, 0.84, 0.15], facecolor=SURFACE)
+        ax_r = fig.add_axes([0.1, 0.45, 0.84, 0.08], facecolor=SURFACE, sharex=ax_t)
+        ax_t.plot(hours, temps, color=TEMP_COLOR, linewidth=2)
+        for i in (temps.index(lo), temps.index(hi)):  # подписываем только минимум и максимум
+            ax_t.annotate(f"{temps[i]:.0f}°", (hours[i], temps[i]), textcoords="offset points",
+                          xytext=(0, 7), ha="center", fontsize=10, color=INK)
+        ax_t.set_ylim(lo - 2, hi + 3)
+        ax_t.set_title("Температура, °C", loc="left", fontsize=10, color=INK_2, pad=4)
+        ax_r.bar(hours, rain, width=0.7, color=RAIN_COLOR)
+        ax_r.set_ylim(0, 100)
+        ax_r.set_yticks([0, 50, 100])
+        ax_r.set_title("Вероятность дождя, %", loc="left", fontsize=10, color=INK_2, pad=4)
+        ax_r.set_xticks(range(6, 24, 3), [f"{x}:00" for x in range(6, 24, 3)])
+        for ax in (ax_t, ax_r):
+            ax.tick_params(colors=INK_2, labelsize=8, length=0)
+            ax.grid(axis="y", color=GRID, linewidth=0.8)
+            ax.set_axisbelow(True)
+            for side in ("top", "right", "left"):
+                ax.spines[side].set_visible(False)
+            ax.spines["bottom"].set_color(GRID)
+        plt.setp(ax_t.get_xticklabels(), visible=False)
+
+    if rates:  # плашки с курсами
+        fig.text(0.07, 0.395, "Курсы НБРБ, BYN", fontsize=10, color=INK_2, va="top")
+        w = 0.86 / len(rates)
+        for k, r in enumerate(rates):
+            x = 0.07 + k * w
+            fig.patches.append(matplotlib.patches.FancyBboxPatch(
+                (x, 0.295), w - 0.02, 0.085, boxstyle="round,pad=0,rounding_size=0.012",
+                transform=fig.transFigure, facecolor="#f1f0ec", edgecolor="none"))
+            label = r["code"] if r["scale"] == 1 else f"{r['scale']} {r['code']}"
+            fig.text(x + 0.02, 0.365, label, fontsize=10, color=INK_2, va="top")
+            arrow = "" if not r["delta"] else (" ▲" if r["delta"] > 0 else " ▼")
+            fig.text(x + 0.02, 0.335, f"{r['rate']:.4f}{arrow}", fontsize=15, fontweight="bold",
+                     color=INK, va="top")
+
+    if highlights:  # главное сегодня — из digest.json
+        fig.text(0.07, 0.255, "Сегодня стоит", fontsize=10, color=INK_2, va="top")
+        y = 0.225
+        for item in highlights[:3]:
+            fig.text(0.07, y, shorten(str(item.get("title", "")), 38), fontsize=13, fontweight="bold",
+                     color=INK, va="top")
+            meta = " · ".join(str(item[k]) for k in ("when", "where") if item.get(k))
+            fig.text(0.07, y - 0.03, shorten(meta, 60), fontsize=10, color=INK_2, va="top")
+            y -= 0.07
+
+    fig.savefig(path, facecolor=SURFACE)
+    plt.close(fig)
+    return True
+
+
+def shorten(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+# ---------- мем дня ----------
+
+def get_meme(digest: dict) -> tuple[Path, str] | None:
+    """Картинка мема: файл от routine или (если она не смогла скачать) загрузка по meme.url."""
+    meme = digest.get("meme") or {}
+    caption = "😂 Мем дня" + (f"\n{meme['caption']}" if meme.get("caption") else "")
+    for path in MEME_FILES:
+        if path.exists() and 0 < path.stat().st_size <= PHOTO_MAX_BYTES:
+            return path, caption
+    if not str(meme.get("url", "")).startswith("http"):
+        return None
+    try:
+        r = requests.get(meme["url"], timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; digest-bot/1.0)"})
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"Мем не скачался: {e}", file=sys.stderr)
+        return None
+    ext = PHOTO_TYPES.get(r.headers.get("content-type", "").split(";")[0])
+    if not ext or len(r.content) > PHOTO_MAX_BYTES:
+        print(f"Мем не подошёл: {r.headers.get('content-type')}, {len(r.content)} байт", file=sys.stderr)
+        return None
+    path = ROOT / f"meme{ext}"
+    path.write_bytes(r.content)
+    return path, caption
 
 
 # ---------- подборка ----------
-# Общая часть (погода, новости, афиша — с веб-поиском) собирается ОДИН раз на всех получателей,
-# личная (приветствие, шутка, комплимент по имени) — дешёвым запросом без поиска на каждого.
 
-FORMAT_RULES = """- Формат — простой текст для Telegram, БЕЗ Markdown (никаких *, #, **). Заголовки разделов с эмодзи,
-  пункты через «•», ссылки — просто URL на отдельной строке."""
-
-
-def today_line(cfg: dict) -> str:
-    today = datetime.now(ZoneInfo(cfg["timezone"]))
-    return f"Сегодня {today:%d.%m.%Y} ({WEEKDAYS[today.weekday()]})."
-
-
-def numbered(sections: list[str]) -> str:
-    return "\n".join(f"{i}. {s}" for i, s in enumerate(sections, 1))
-
-
-def build_shared_prompt(cfg: dict, weather: str) -> str:
-    return f"""Ты — утренний бот, собираешь подборку по городу {cfg['city']}. {today_line(cfg)}
-Язык: {cfg['language']}. Эту часть получат несколько человек, поэтому без приветствия и обращений по имени —
-начни сразу с первого раздела.
-
-Разделы строго в таком порядке:
-{numbered(cfg['sections'])}
-
-Данные о погоде в городе {cfg['city']} (Open-Meteo):
-{weather}
-
-Правила:
-- Для новостей и мероприятий обязательно используй веб-поиск (местные сайты, афиши, соцсети города).
-  Опирайся только на найденное, ничего не выдумывай. Если мероприятий мало — лучше меньше, но настоящие.
-- Каждая новость: 1–2 предложения сути + ссылка на источник.
-{FORMAT_RULES}
-- Если по разделу ничего стоящего не нашлось — так и напиши одной строкой.
-- Выведи только сами разделы, без комментариев о поиске."""
-
-
-def build_personal_prompt(cfg: dict, name: str, shared: str) -> str:
-    return f"""Ты — тёплый и остроумный утренний бот. {today_line(cfg)} Язык: {cfg['language']}.
-Получателя зовут {name}. Он получит утреннюю подборку, её общая часть уже готова:
-
-<общая_часть>
-{shared}
-</общая_часть>
-
-Напиши две личные части, которые встанут до и после общей:
-- intro: короткое приветствие по имени, затем разделы:
-{numbered(cfg['intro_sections'])}
-- outro: разделы:
-{numbered(cfg['outro_sections'])}
-
-Правила:
-{FORMAT_RULES}
-- Не повторяй общую часть, но можешь на неё ссылаться (например, обыграть погоду или новость).
-- Род в обращениях и комплименте определи по имени; если непонятно — используй нейтральные формулировки."""
-
-
-def ask_claude(cfg: dict, prompt: str, label: str, **kwargs) -> str:
-    """Запрос к Claude. Длинный поиск приходит кусками с stop_reason=pause_turn: продолжаем,
-    склеиваем текст всех кусков и логируем суммарный расход (он и определяет цену)."""
-    client = anthropic.Anthropic()
-    messages = [{"role": "user", "content": prompt}]
-    texts, input_tokens, output_tokens, searches, chunks = [], 0, 0, 0, 0
-    for _ in range(10):
-        chunks += 1
-        resp = client.messages.create(model=cfg["model"], max_tokens=16000, messages=messages, **kwargs)
-        texts += [b.text for b in resp.content if b.type == "text"]
-        input_tokens += resp.usage.input_tokens
-        output_tokens += resp.usage.output_tokens
-        if resp.usage.server_tool_use:
-            searches += resp.usage.server_tool_use.web_search_requests or 0
-        if resp.stop_reason != "pause_turn":
-            break
-        messages.append({"role": "assistant", "content": resp.content})
-
-    print(f"Claude [{label}]: stop_reason={resp.stop_reason}, input_tokens={input_tokens}, "
-          f"output_tokens={output_tokens}, web_searches={searches}, chunks={chunks}")
-    if resp.stop_reason in ("max_tokens", "pause_turn"):
-        print(f"⚠️ Ответ Claude [{label}] неполный (stop_reason={resp.stop_reason}) — конец мог обрезаться",
-              file=sys.stderr)
-    text = "".join(texts).strip()
-    if not text:
-        raise RuntimeError(f"Пустой ответ от Claude [{label}] (stop_reason={resp.stop_reason})")
-    return text
-
-
-def generate_shared(cfg: dict) -> str:
-    location = {"type": "approximate", "city": cfg["city"], "timezone": cfg["timezone"]}
-    if cfg.get("country"):  # веб-поиск поддерживает не все страны (например, BY — нет)
-        location["country"] = cfg["country"]
-    tools = [{
-        "type": "web_search_20260209",  # с динамической фильтрацией: в контекст идёт меньше лишнего
-        "name": "web_search",
-        "max_uses": cfg["max_searches"],
-        "user_location": location,
-    }]
-    return ask_claude(cfg, build_shared_prompt(cfg, get_weather(cfg)), "общая часть", tools=tools)
-
-
-def generate_personal(cfg: dict, name: str, shared: str) -> tuple[str, str]:
-    text = ask_claude(cfg, build_personal_prompt(cfg, name, shared), f"личная часть: {name}",
-                      output_config={"format": {"type": "json_schema", "schema": {
-                          "type": "object",
-                          "properties": {"intro": {"type": "string"}, "outro": {"type": "string"}},
-                          "required": ["intro", "outro"],
-                          "additionalProperties": False,
-                      }}})
-    parts = json.loads(text)
-    return parts["intro"].strip(), parts["outro"].strip()
+def load_digest(cfg: dict) -> dict | None:
+    """digest.json от routine, если он собран сегодня."""
+    if not DIGEST_FILE.exists():
+        return None
+    try:
+        digest = json.loads(DIGEST_FILE.read_text(encoding="utf-8"))
+    except ValueError as e:
+        print(f"digest.json битый: {e}", file=sys.stderr)
+        return None
+    if digest.get("date") != today(cfg).isoformat():
+        print(f"digest.json не за сегодня (дата «{digest.get('date')}») — шлём приветствие, погоду и курсы")
+        return None
+    return digest
 
 
 def main() -> None:
     state = load_state()
-    ensure_names(state)
+    if DRY_RUN:
+        state["users"] = state["users"] or {"dry-run": {"name": "Друг"}}
+    else:
+        ensure_names(state)
+    if SYNC_ONLY:
+        print(f"Синхронизация: получателей {len(state['users'])}")
+        return
     if not state["users"]:
         print("Получателей нет: открой ссылку-приглашение и нажми Start.")
         return
 
+    digest = load_digest(CONFIG) or {}
+    hourly, rates = get_hourly(CONFIG), get_rates()
+    common = [weather_section(hourly) if hourly else "", rates_section(rates) if rates else "",
+              digest.get("shared", "")]
     try:
-        shared = generate_shared(CONFIG)
-    except Exception as e:
-        if DRY_RUN:
-            raise
-        print(f"Общая часть подборки не собрана: {e}", file=sys.stderr)
-        for chat_id in state["users"]:
-            try:
-                send(chat_id, f"⚠️ Не удалось собрать подборку: {e}")
-            except Exception:
-                pass  # например, пользователь заблокировал бота
-        sys.exit(1)
+        card = render_card(CONFIG, hourly, rates, digest.get("highlights") or [], CARD_FILE)
+    except Exception as e:  # карточка — бонус, без неё подборка всё равно уходит
+        print(f"Карточку нарисовать не удалось: {e}", file=sys.stderr)
+        card = False
+
+    meme = get_meme(digest)
 
     failed = False
     for chat_id, user in state["users"].items():
         name = user.get("name") or "друг"
+        personal = (digest.get("personal") or {}).get(chat_id)
+        if personal:
+            parts = [personal.get("intro"), personal.get("for_you")]
+            outro = personal.get("outro")
+        else:  # новый получатель или нет digest.json — общий вариант
+            parts = [f"Доброе утро, {name}! ☀️"]
+            outro = (digest.get("default") or {}).get("outro")
+        text = "\n\n".join(p.strip() for p in (*parts, *common, outro) if p and p.strip())
         try:
-            intro, outro = generate_personal(CONFIG, name, shared)
-        except Exception as e:
-            if DRY_RUN:
-                raise
-            print(f"Личная часть для {chat_id} не собрана, шлём без неё: {e}", file=sys.stderr)
-            intro, outro = f"Доброе утро, {name}! ☀️", ""
-        try:
-            send(chat_id, "\n\n".join(p for p in (intro, shared, outro) if p))
+            if card:
+                send_photo(chat_id, CARD_FILE)
+            send(chat_id, text)
         except Exception as e:
             failed = True
             print(f"Подборка для {chat_id} не отправлена: {e}", file=sys.stderr)
+            continue
+        if meme:
+            try:  # мем — бонус: его сбой не считается сбоем подборки
+                send_photo(chat_id, *meme)
+            except Exception as e:
+                print(f"Мем для {chat_id} не отправлен: {e}", file=sys.stderr)
     if failed:
         sys.exit(1)
 
