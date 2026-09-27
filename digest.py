@@ -239,14 +239,21 @@ def generate_digest(cfg: dict, name: str) -> str:
         "max_uses": cfg["max_searches"],
         "user_location": location,
     }]
-    for _ in range(5):  # длинный поиск может прийти с stop_reason=pause_turn — продолжаем
-        resp = client.messages.create(model=cfg["model"], max_tokens=8000,
+    # длинный поиск приходит кусками с stop_reason=pause_turn: продолжаем и собираем текст всех кусков
+    texts = []
+    for _ in range(10):
+        resp = client.messages.create(model=cfg["model"], max_tokens=16000,
                                       messages=messages, tools=tools)
+        texts += [b.text for b in resp.content if b.type == "text"]
         if resp.stop_reason != "pause_turn":
             break
         messages.append({"role": "assistant", "content": resp.content})
 
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    print(f"Claude: stop_reason={resp.stop_reason}, output_tokens={resp.usage.output_tokens}")
+    if resp.stop_reason in ("max_tokens", "pause_turn"):
+        print(f"⚠️ Ответ Claude неполный (stop_reason={resp.stop_reason}) — конец подборки мог обрезаться",
+              file=sys.stderr)
+    text = "".join(texts).strip()
     if not text:
         raise RuntimeError(f"Пустой ответ от Claude (stop_reason={resp.stop_reason})")
     return text
