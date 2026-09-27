@@ -1,5 +1,5 @@
-"""Ежедневная подборка: открытка «С добрым утром», карточка-инфографика (погода, курсы, главное сегодня),
-новости, афиша, кино, комплимент и мем дня.
+"""Ежедневная подборка: открытка «С добрым утром», видео-выпуск новостей (video.py), карточка-инфографика
+(погода, курсы, главное сегодня), новости, афиша, кино, комплимент и мем дня.
 
 Все тексты заранее пишет routine в Claude Code по routine.md (из подписки, без API): общую часть
 и личные приветствие, «для тебя» и комплимент для каждого получателя из state.json, открытку и мем.
@@ -41,6 +41,8 @@ CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 STATE_FILE = ROOT / "state.json"
 DIGEST_FILE = ROOT / "digest.json"  # пишет routine, см. routine.md
 CARD_FILE = ROOT / "card.png"
+VIDEO_FILE = ROOT / "news.mp4"
+VIDEO_MAX_BYTES = 50_000_000  # лимит Bot API на отправку файла
 PHOTO_TYPES = {"image/jpeg": ".jpg", "image/png": ".png"}
 PHOTO_MAX_BYTES = 10_000_000  # лимит Telegram на фото
 TG_LIMIT = 4000  # у Telegram лимит 4096 символов на сообщение
@@ -140,6 +142,15 @@ def send_photo(chat_id: str, path: Path, caption: str = "") -> None:
         return
     with path.open("rb") as f:
         tg("sendPhoto", files={"photo": f}, chat_id=chat_id, caption=caption[:1024])
+
+
+def send_video(chat_id: str, path: Path, caption: str = "") -> None:
+    if DRY_RUN:
+        print(f"[видео: {path}] {caption}")
+        return
+    with path.open("rb") as f:
+        tg("sendVideo", files={"video": f}, chat_id=chat_id, caption=caption[:1024],
+           supports_streaming="true", width="1080", height="1920")
 
 
 def split_message(text: str, limit: int = TG_LIMIT, measure=len) -> list[str]:
@@ -482,21 +493,93 @@ def get_picture(digest: dict, key: str) -> tuple[Path, str] | None:
     for path in (ROOT / f"{base}.jpg", ROOT / f"{base}.png"):
         if path.exists() and 0 < path.stat().st_size <= PHOTO_MAX_BYTES:
             return path, caption
-    if not str(info.get("url", "")).startswith("http"):
+    path = download_image(str(info.get("url", "")), ROOT / base, key)
+    return (path, caption) if path else None
+
+
+def download_image(url: str, dest_base: Path, label: str) -> Path | None:
+    """Скачивает JPEG/PNG до 10 МБ в <dest_base>.jpg/.png (запасной путь, если routine не положила файл)."""
+    if not url.startswith("http"):
         return None
     try:
-        r = requests.get(info["url"], timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; digest-bot/1.0)"})
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; digest-bot/1.0)"})
         r.raise_for_status()
     except requests.RequestException as e:
-        print(f"{key}: картинка не скачалась: {e}", file=sys.stderr)
+        print(f"{label}: картинка не скачалась: {e}", file=sys.stderr)
         return None
     ext = PHOTO_TYPES.get(r.headers.get("content-type", "").split(";")[0])
     if not ext or len(r.content) > PHOTO_MAX_BYTES:
-        print(f"{key}: картинка не подошла: {r.headers.get('content-type')}, {len(r.content)} байт", file=sys.stderr)
+        print(f"{label}: картинка не подошла: {r.headers.get('content-type')}, {len(r.content)} байт", file=sys.stderr)
         return None
-    path = ROOT / f"{base}{ext}"
+    dest_base.parent.mkdir(parents=True, exist_ok=True)
+    path = dest_base.with_suffix(ext)
     path.write_bytes(r.content)
-    return path, caption
+    return path
+
+
+ALBUM_MAX = 6
+
+
+def get_album(chat_id: str, personal: dict) -> list[tuple[Path, str]]:
+    """Личный фотоальбом к «Для тебя» (визуальные интересы вроде моды): [(файл, подпись)].
+    Файлы routine кладёт в album/<chat_id>/ ветки claude/shared; нет файла — качаем по url."""
+    photos = []
+    for n, item in enumerate((personal.get("album") or [])[:ALBUM_MAX]):
+        if not isinstance(item, dict):
+            continue
+        path = ROOT / str(item.get("file", ""))
+        if not (item.get("file") and path.is_file() and 0 < path.stat().st_size <= PHOTO_MAX_BYTES
+                and ROOT.resolve() in path.resolve().parents):  # только файлы внутри репозитория
+            path = download_image(str(item.get("url", "")), ROOT / "album" / chat_id / f"dl{n}", f"album {chat_id}")
+        if path:
+            caption = "\n".join(c for c in (str(item.get("caption", "")), str(item.get("source", ""))) if c)
+            photos.append((path, caption))
+    return photos
+
+
+def send_album(chat_id: str, photos: list[tuple[Path, str]]) -> None:
+    if DRY_RUN:
+        for path, caption in photos:
+            print(f"[альбом: {path.name}] {caption}")
+        return
+    if len(photos) == 1:
+        send_photo(chat_id, *photos[0])
+        return
+    media = [{"type": "photo", "media": f"attach://p{i}", "caption": caption[:1024]}
+             for i, (_, caption) in enumerate(photos)]
+    files = {f"p{i}": path.open("rb") for i, (path, _) in enumerate(photos)}
+    try:
+        tg("sendMediaGroup", files=files, chat_id=chat_id, media=json.dumps(media, ensure_ascii=False))
+    finally:
+        for f in files.values():
+            f.close()
+
+
+# ---------- видео-выпуск ----------
+
+def build_news_video(digest: dict, hourly: dict | None, card: bool, meme: tuple[Path, str] | None) -> Path | None:
+    """Мини-выпуск новостей по digest["video"]["segments"]; сюжет о погоде вставляется вторым.
+    Любая ошибка — без видео, подборка уходит как обычно."""
+    segments = list((digest.get("video") or {}).get("segments") or [])
+    if not segments:
+        return None
+    try:
+        import video
+        if hourly and card:
+            segments.insert(1, video.weather_segment(hourly, rain_windows))
+        pictures = {"card": CARD_FILE} if card else {}
+        if meme:
+            pictures["meme"] = meme[0]
+        ticker = "  •  ".join(str(s.get("title", "")) for s in segments if s.get("title")) + "  •  "
+        path = video.make_video(segments, f"{CONFIG['city'].upper()} · УТРО", ticker, pictures,
+                                ROOT / "video_work", VIDEO_FILE)
+        if path.stat().st_size > VIDEO_MAX_BYTES:
+            print(f"Видео слишком большое: {path.stat().st_size} байт", file=sys.stderr)
+            return None
+        return path
+    except Exception as e:
+        print(f"Видео-выпуск не собрался: {e}", file=sys.stderr)
+        return None
 
 
 # ---------- подборка ----------
@@ -546,6 +629,7 @@ def main() -> None:
     common.append(digest.get("shared", ""))
 
     postcard, meme = get_picture(digest, "postcard"), get_picture(digest, "meme")
+    news_video = build_news_video(digest, hourly, card, meme)
 
     failed_ids = []
     for chat_id, user in state["users"].items():
@@ -563,6 +647,11 @@ def main() -> None:
                 send_photo(chat_id, *postcard)
             except Exception as e:
                 print(f"Открытка для {chat_id} не отправлена: {e}", file=sys.stderr)
+        if news_video:
+            try:  # видео-выпуск — бонус, как открытка и мем
+                send_video(chat_id, news_video, "📺 Утренний выпуск")
+            except Exception as e:
+                print(f"Видео для {chat_id} не отправлено: {e}", file=sys.stderr)
         try:
             if card:
                 send_photo(chat_id, CARD_FILE)
@@ -571,6 +660,11 @@ def main() -> None:
             failed_ids.append(chat_id)
             print(f"Подборка для {chat_id} не отправлена: {e}", file=sys.stderr)
             continue
+        if personal and (album := get_album(chat_id, personal)):
+            try:  # фотоальбом к «Для тебя» — бонус
+                send_album(chat_id, album)
+            except Exception as e:
+                print(f"Альбом для {chat_id} не отправлен: {e}", file=sys.stderr)
         if meme:
             try:  # мем — бонус: его сбой не считается сбоем подборки
                 send_photo(chat_id, *meme)

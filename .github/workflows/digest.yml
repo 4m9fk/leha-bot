@@ -55,6 +55,7 @@ jobs:
           (git fetch --depth 1 origin claude/shared && git show FETCH_HEAD:digest.json > digest.json) \
             || { rm -f digest.json; echo "digest.json в ветке claude/shared нет"; }
           for f in postcard.jpg postcard.png meme.jpg meme.png; do git show "FETCH_HEAD:$f" > "$f" 2>/dev/null || rm -f "$f"; done
+          git archive FETCH_HEAD album 2>/dev/null | tar -x || echo "личных альбомов нет"
 
       - name: Send digest
         env:
