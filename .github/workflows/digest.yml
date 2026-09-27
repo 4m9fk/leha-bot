@@ -33,7 +33,7 @@ jobs:
         run: |
           (git fetch --depth 1 origin claude/shared && git show FETCH_HEAD:digest.json > digest.json) \
             || { rm -f digest.json; echo "digest.json в ветке claude/shared нет"; }
-          for f in meme.jpg meme.png; do git show "FETCH_HEAD:$f" > "$f" 2>/dev/null || rm -f "$f"; done
+          for f in postcard.jpg postcard.png meme.jpg meme.png; do git show "FETCH_HEAD:$f" > "$f" 2>/dev/null || rm -f "$f"; done
 
       - name: Send digest
         env:

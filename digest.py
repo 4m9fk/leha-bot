@@ -1,8 +1,8 @@
-"""Ежедневная подборка: шутка, погода, курсы, новости, быт, афиша, кино, комплимент — плюс карточка-инфографика
-и мем дня.
+"""Ежедневная подборка: открытка «С добрым утром», карточка-инфографика (погода, курсы, главное сегодня),
+новости, афиша, кино, комплимент и мем дня.
 
 Все тексты заранее пишет routine в Claude Code по routine.md (из подписки, без API): общую часть
-и личные приветствие, шутку, «для тебя» и комплимент для каждого получателя из state.json.
+и личные приветствие, «для тебя» и комплимент для каждого получателя из state.json, открытку и мем.
 Результат — digest.json в ветке claude/shared; workflow подкладывает его рядом со скриптом.
 Этот скрипт только добавляет погоду (Open-Meteo) и курсы (НБРБ), рисует карточку и рассылает.
 Если digest.json за сегодня нет — уходит приветствие, погода и курсы.
@@ -16,11 +16,13 @@
   DRY_RUN=1           (необязательно) напечатать подборку и сохранить card.png, а не отправлять
 
 Получатели, имена и интересы хранятся в state.json (workflow коммитит его обратно в репозиторий).
-Подписаться: открыть ссылку-приглашение и нажать Start. Команды: /name Имя, /interests кино, спорт.
+Подписаться: открыть ссылку-приглашение и нажать Start. Команды: /name Имя, /interests кино, спорт, /zodiac Лев.
 """
 
+import html
 import json
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -34,7 +36,6 @@ CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 STATE_FILE = ROOT / "state.json"
 DIGEST_FILE = ROOT / "digest.json"  # пишет routine, см. routine.md
 CARD_FILE = ROOT / "card.png"
-MEME_FILES = [ROOT / "meme.jpg", ROOT / "meme.png"]  # картинку мема routine кладёт рядом с digest.json
 PHOTO_TYPES = {"image/jpeg": ".jpg", "image/png": ".png"}
 PHOTO_MAX_BYTES = 10_000_000  # лимит Telegram на фото
 TG_LIMIT = 4000  # у Telegram лимит 4096 символов на сообщение
@@ -44,6 +45,9 @@ INVITE_CODE = os.getenv("INVITE_CODE", "").strip()
 RAIN_PROBABILITY = 40  # %, с какой вероятности осадков считать час дождливым
 CURRENCIES = ("USD", "EUR", "RUB")
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+ZODIAC = ["Овен", "Телец", "Близнецы", "Рак", "Лев", "Дева",
+          "Весы", "Скорпион", "Стрелец", "Козерог", "Водолей", "Рыбы"]
+DEFAULT_ZODIAC = "Дева"  # для тех, кто не выбрал знак; routine берёт его из config.json
 MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
           "июля", "августа", "сентября", "октября", "ноября", "декабря"]
 
@@ -62,7 +66,7 @@ def today(cfg: dict) -> date:
 # ---------- состояние ----------
 
 def load_state() -> dict:
-    """state.json: {"users": {chat_id: {"name", "awaiting_name", "interests"}}}."""
+    """state.json: {"users": {chat_id: {"name", "awaiting_name", "interests", "zodiac"}}}."""
     state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
     users = state.setdefault("users", {})
     owner = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -94,14 +98,29 @@ def tg(method: str, files: dict | None = None, **params) -> dict:
     return data["result"]
 
 
-def send(chat_id: str, text: str) -> None:
+def send(chat_id: str, text: str, html_mode: bool = False) -> None:
+    """html_mode — текст в Telegram-HTML (<b>, <i>, <a>, <blockquote expandable>). Если Telegram не разобрал
+    разметку, кусок уходит простым текстом без тегов, а не теряется."""
     if DRY_RUN:
         print(text, "\n" + "-" * 40)
         return
     for part in split_message(text):
         # ранний синхронизирующий запуск идёт ночью — отвечаем без звука
-        tg("sendMessage", chat_id=chat_id, text=part, disable_web_page_preview=True,
-           disable_notification=SYNC_ONLY)
+        params = dict(chat_id=chat_id, disable_web_page_preview=True, disable_notification=SYNC_ONLY)
+        if not html_mode:
+            tg("sendMessage", text=part, **params)
+            continue
+        try:
+            tg("sendMessage", text=part, parse_mode="HTML", **params)
+        except RuntimeError as e:
+            if "can't parse entities" not in str(e):
+                raise
+            print(f"HTML не разобрался, шлём без разметки: {e}", file=sys.stderr)
+            tg("sendMessage", text=strip_html(part), **params)
+
+
+def strip_html(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
 def send_photo(chat_id: str, path: Path, caption: str = "") -> None:
@@ -113,13 +132,18 @@ def send_photo(chat_id: str, path: Path, caption: str = "") -> None:
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
+    """Режет по разделам (абзацам через пустую строку), чтобы не разрывать HTML-теги;
+    раздел длиннее лимита — по строкам, а строку длиннее лимита — как есть кусками."""
     parts, current = [], ""
-    for line in text.splitlines(keepends=True):
-        while len(line) > limit:
-            parts.append(line[:limit]); line = line[limit:]
-        if len(current) + len(line) > limit:
-            parts.append(current); current = ""
-        current += line
+    for block in text.split("\n\n"):
+        pieces = [block] if len(block) <= limit else block.splitlines()
+        for piece in pieces:
+            while len(piece) > limit:
+                parts.append(piece[:limit]); piece = piece[limit:]
+            sep = "\n\n" if piece is block else "\n"
+            if current and len(current) + len(sep) + len(piece) > limit:
+                parts.append(current); current = ""
+            current = f"{current}{sep}{piece}" if current else piece
     if current.strip():
         parts.append(current)
     return parts
@@ -138,7 +162,7 @@ def fetch_messages(offset: int | None, timeout: int = 0) -> tuple[list[tuple[str
 
 
 def ask_name(chat_id: str, user: dict, asked: set[str]) -> None:
-    send(chat_id, "Привет! 👋 Я утренний бот: шутка, погода, новости и афиша "
+    send(chat_id, "Привет! 👋 Я утренний бот: открытка, погода, новости, афиша и мем дня "
                   f"города {CONFIG['city']}. Как тебя зовут?")
     user["awaiting_name"] = True
     asked.add(chat_id)
@@ -170,6 +194,17 @@ def handle_messages(messages: list[tuple[str, str]], state: dict, asked: set[str
             else:
                 user.pop("interests", None)
                 send(chat_id, "Интересы сброшены.")
+        elif text.startswith("/zodiac"):
+            arg = text[len("/zodiac"):].strip().lower()
+            sign = next((z for z in ZODIAC if z.lower() == arg), None)
+            if sign:
+                user["zodiac"] = sign
+                send(chat_id, f"Запомнил: {sign} 🔮 Звёзды уже в курсе. Гороскоп — со следующего утра.")
+            elif not arg:
+                user.pop("zodiac", None)
+                send(chat_id, f"Знак сброшен — гороскоп снова для «{DEFAULT_ZODIAC}».")
+            else:
+                send(chat_id, "Не знаю такого знака 🤔 Напиши, например: /zodiac Рыбы\n" + ", ".join(ZODIAC))
         elif text.startswith("/"):
             continue  # /start и прочие команды
         elif user.get("awaiting_name") and not user.get("name"):
@@ -178,10 +213,22 @@ def handle_messages(messages: list[tuple[str, str]], state: dict, asked: set[str
             send(chat_id, f"Приятно познакомиться, {user['name']}! 🤗 "
                           "Теперь каждое утро буду присылать тебе подборку.\n"
                           "Сменить имя — /name и новое имя. Расскажи, что тебе интересно, — "
-                          "например, /interests кино, концерты, спорт — и я буду подбирать это отдельно.")
+                          "например, /interests кино, концерты, спорт — и я буду подбирать это отдельно.\n"
+                          f"Гороскоп пока для знака «{DEFAULT_ZODIAC}» — свой знак: /zodiac Лев.")
+
+
+BOT_COMMANDS = [  # меню «/» в Telegram; держать в синхроне с handle_messages
+    {"command": "name", "description": "Сменить имя: /name Новое имя"},
+    {"command": "interests", "description": "Интересы для «Для тебя»: /interests кино, концерты"},
+    {"command": "zodiac", "description": "Знак зодиака для гороскопа: /zodiac Лев"},
+]
 
 
 def ensure_names(state: dict) -> None:
+    try:  # идемпотентно: меню всегда совпадает с кодом
+        tg("setMyCommands", commands=BOT_COMMANDS)
+    except Exception as e:
+        print(f"Меню команд не обновилось: {e}", file=sys.stderr)
     users, asked = state["users"], set()
     messages, offset = fetch_messages(None)
     handle_messages(messages, state, asked)
@@ -356,28 +403,33 @@ def shorten(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
-# ---------- мем дня ----------
+# ---------- картинки от routine: открытка и мем ----------
 
-def get_meme(digest: dict) -> tuple[Path, str] | None:
-    """Картинка мема: файл от routine или (если она не смогла скачать) загрузка по meme.url."""
-    meme = digest.get("meme") or {}
-    caption = "😂 Мем дня" + (f"\n{meme['caption']}" if meme.get("caption") else "")
-    for path in MEME_FILES:
+# ключ в digest.json → (базовое имя файла в ветке claude/shared, подпись в Telegram)
+PICTURES = {"postcard": ("postcard", ""), "meme": ("meme", "😂 Мем дня")}
+
+
+def get_picture(digest: dict, key: str) -> tuple[Path, str] | None:
+    """Картинка от routine: файл <base>.jpg/.png из ветки или (если она не смогла скачать) загрузка по url."""
+    base, title = PICTURES[key]
+    info = digest.get(key) or {}
+    caption = "\n".join(c for c in (title, info.get("caption", "")) if c)
+    for path in (ROOT / f"{base}.jpg", ROOT / f"{base}.png"):
         if path.exists() and 0 < path.stat().st_size <= PHOTO_MAX_BYTES:
             return path, caption
-    if not str(meme.get("url", "")).startswith("http"):
+    if not str(info.get("url", "")).startswith("http"):
         return None
     try:
-        r = requests.get(meme["url"], timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; digest-bot/1.0)"})
+        r = requests.get(info["url"], timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; digest-bot/1.0)"})
         r.raise_for_status()
     except requests.RequestException as e:
-        print(f"Мем не скачался: {e}", file=sys.stderr)
+        print(f"{key}: картинка не скачалась: {e}", file=sys.stderr)
         return None
     ext = PHOTO_TYPES.get(r.headers.get("content-type", "").split(";")[0])
     if not ext or len(r.content) > PHOTO_MAX_BYTES:
-        print(f"Мем не подошёл: {r.headers.get('content-type')}, {len(r.content)} байт", file=sys.stderr)
+        print(f"{key}: картинка не подошла: {r.headers.get('content-type')}, {len(r.content)} байт", file=sys.stderr)
         return None
-    path = ROOT / f"meme{ext}"
+    path = ROOT / f"{base}{ext}"
     path.write_bytes(r.content)
     return path, caption
 
@@ -414,15 +466,17 @@ def main() -> None:
 
     digest = load_digest(CONFIG) or {}
     hourly, rates = get_hourly(CONFIG), get_rates()
-    common = [weather_section(hourly) if hourly else "", rates_section(rates) if rates else "",
-              digest.get("shared", "")]
     try:
         card = render_card(CONFIG, hourly, rates, digest.get("highlights") or [], CARD_FILE)
     except Exception as e:  # карточка — бонус, без неё подборка всё равно уходит
         print(f"Карточку нарисовать не удалось: {e}", file=sys.stderr)
         card = False
+    # погода и курсы живут на карточке; текстом — только если карточки нет
+    common = [] if card else [html.escape(weather_section(hourly)) if hourly else "",
+                              html.escape(rates_section(rates)) if rates else ""]
+    common.append(digest.get("shared", ""))
 
-    meme = get_meme(digest)
+    postcard, meme = get_picture(digest, "postcard"), get_picture(digest, "meme")
 
     failed = False
     for chat_id, user in state["users"].items():
@@ -432,13 +486,18 @@ def main() -> None:
             parts = [personal.get("intro"), personal.get("for_you")]
             outro = personal.get("outro")
         else:  # новый получатель или нет digest.json — общий вариант
-            parts = [f"Доброе утро, {name}! ☀️"]
+            parts = [f"Доброе утро, {html.escape(name)}! ☀️"]
             outro = (digest.get("default") or {}).get("outro")
         text = "\n\n".join(p.strip() for p in (*parts, *common, outro) if p and p.strip())
+        if postcard:
+            try:  # открытка — бонус, как и мем: её сбой не считается сбоем подборки
+                send_photo(chat_id, *postcard)
+            except Exception as e:
+                print(f"Открытка для {chat_id} не отправлена: {e}", file=sys.stderr)
         try:
             if card:
                 send_photo(chat_id, CARD_FILE)
-            send(chat_id, text)
+            send(chat_id, text, html_mode=True)
         except Exception as e:
             failed = True
             print(f"Подборка для {chat_id} не отправлена: {e}", file=sys.stderr)
