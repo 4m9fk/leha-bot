@@ -21,7 +21,7 @@
   DRY_RUN=1           (необязательно) напечатать подборку и сохранить card.png, а не отправлять
 
 Получатели, имена и интересы хранятся в state.json (workflow коммитит его обратно в репозиторий).
-Подписаться: открыть ссылку-приглашение и нажать Start. Команды: /name Имя, /interests кино, спорт, /zodiac Лев.
+Подписаться: открыть ссылку-приглашение и нажать Start. Команды: /name Имя, /interests кино, спорт.
 """
 
 import html
@@ -52,9 +52,6 @@ INVITE_CODE = os.getenv("INVITE_CODE", "").strip()
 RAIN_PROBABILITY = 40  # %, с какой вероятности осадков считать час дождливым
 CURRENCIES = ("USD", "EUR", "RUB")
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-ZODIAC = ["Овен", "Телец", "Близнецы", "Рак", "Лев", "Дева",
-          "Весы", "Скорпион", "Стрелец", "Козерог", "Водолей", "Рыбы"]
-DEFAULT_ZODIAC = "Дева"  # для тех, кто не выбрал знак; routine берёт его из config.json
 MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
           "июля", "августа", "сентября", "октября", "ноября", "декабря"]
 
@@ -73,7 +70,7 @@ def today(cfg: dict) -> date:
 # ---------- состояние ----------
 
 def load_state() -> dict:
-    """state.json: {"users": {chat_id: {"name", "awaiting_name", "interests", "zodiac"}},
+    """state.json: {"users": {chat_id: {"name", "awaiting_name", "interests"}},
     "delivered": "YYYY-MM-DD" — когда последний раз ушла рассылка (чтобы не слать дважды)}."""
     state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
     users = state.setdefault("users", {})
@@ -204,17 +201,6 @@ def handle_messages(messages: list[tuple[str, str]], state: dict, asked: set[str
             else:
                 user.pop("interests", None)
                 send(chat_id, "Интересы сброшены.")
-        elif text.startswith("/zodiac"):
-            arg = text[len("/zodiac"):].strip().lower()
-            sign = next((z for z in ZODIAC if z.lower() == arg), None)
-            if sign:
-                user["zodiac"] = sign
-                send(chat_id, f"Запомнил: {sign} 🔮 Звёзды уже в курсе. Гороскоп — со следующего утра.")
-            elif not arg:
-                user.pop("zodiac", None)
-                send(chat_id, f"Знак сброшен — гороскоп снова для «{DEFAULT_ZODIAC}».")
-            else:
-                send(chat_id, "Не знаю такого знака 🤔 Напиши, например: /zodiac Рыбы\n" + ", ".join(ZODIAC))
         elif text.startswith("/"):
             continue  # /start и прочие команды
         elif user.get("awaiting_name") and not user.get("name"):
@@ -223,14 +209,12 @@ def handle_messages(messages: list[tuple[str, str]], state: dict, asked: set[str
             send(chat_id, f"Приятно познакомиться, {user['name']}! 🤗 "
                           "Теперь каждое утро буду присылать тебе подборку.\n"
                           "Сменить имя — /name и новое имя. Расскажи, что тебе интересно, — "
-                          "например, /interests кино, концерты, спорт — и я буду подбирать это отдельно.\n"
-                          f"Гороскоп пока для знака «{DEFAULT_ZODIAC}» — свой знак: /zodiac Лев.")
+                          "например, /interests кино, концерты, спорт — и я буду подбирать это отдельно.")
 
 
 BOT_COMMANDS = [  # меню «/» в Telegram; держать в синхроне с handle_messages
     {"command": "name", "description": "Сменить имя: /name Новое имя"},
     {"command": "interests", "description": "Интересы для «Для тебя»: /interests кино, концерты"},
-    {"command": "zodiac", "description": "Знак зодиака для гороскопа: /zodiac Лев"},
 ]
 
 
