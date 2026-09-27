@@ -11,8 +11,13 @@
   TELEGRAM_BOT_TOKEN  токен от @BotFather
   INVITE_CODE         секретный код для ссылки-приглашения t.me/<бот>?start=<код>
   TELEGRAM_CHAT_ID    (необязательно) chat_id, который подписан сразу, без приглашения
-  SYNC_ONLY=true      (необязательно) только обработать входящие (имена, /name, /interests) и выйти —
-                      ранний запуск перед routine, чтобы она видела свежий state.json
+  MODE                (необязательно) когда и как рассылать; ставит workflow:
+                        force    — разослать сейчас (ручной запуск, по умолчанию)
+                        sync     — только обработать входящие и выйти: ночной запуск перед routine,
+                                   чтобы она видела свежий state.json
+                        morning  — 08:00: разослать, только если выпуск за сегодня уже готов
+                        push     — routine запушила выпуск: разослать, если уже после 08:00 и сегодня не слали
+                        deadline — 10:00: если сегодня ещё не слали — разослать что есть
   DRY_RUN=1           (необязательно) напечатать подборку и сохранить card.png, а не отправлять
 
 Получатели, имена и интересы хранятся в state.json (workflow коммитит его обратно в репозиторий).
@@ -40,7 +45,9 @@ PHOTO_TYPES = {"image/jpeg": ".jpg", "image/png": ".png"}
 PHOTO_MAX_BYTES = 10_000_000  # лимит Telegram на фото
 TG_LIMIT = 4000  # у Telegram лимит 4096 символов на сообщение
 DRY_RUN = bool(os.getenv("DRY_RUN"))
-SYNC_ONLY = os.getenv("SYNC_ONLY") == "true"
+MODE = os.getenv("MODE", "force")
+SYNC_ONLY = MODE == "sync"
+SEND_AFTER_HOUR = 8  # раньше этого часа по Минску push-запуск не рассылает; совпадает с cron «0 5» в workflow
 INVITE_CODE = os.getenv("INVITE_CODE", "").strip()
 RAIN_PROBABILITY = 40  # %, с какой вероятности осадков считать час дождливым
 CURRENCIES = ("USD", "EUR", "RUB")
@@ -66,7 +73,8 @@ def today(cfg: dict) -> date:
 # ---------- состояние ----------
 
 def load_state() -> dict:
-    """state.json: {"users": {chat_id: {"name", "awaiting_name", "interests", "zodiac"}}}."""
+    """state.json: {"users": {chat_id: {"name", "awaiting_name", "interests", "zodiac"}},
+    "delivered": "YYYY-MM-DD" — когда последний раз ушла рассылка (чтобы не слать дважды)}."""
     state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
     users = state.setdefault("users", {})
     owner = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -464,7 +472,10 @@ def main() -> None:
         print("Получателей нет: открой ссылку-приглашение и нажми Start.")
         return
 
-    digest = load_digest(CONFIG) or {}
+    digest = load_digest(CONFIG)
+    if not should_send(state, digest):
+        return
+    digest = digest or {}
     hourly, rates = get_hourly(CONFIG), get_rates()
     try:
         card = render_card(CONFIG, hourly, rates, digest.get("highlights") or [], CARD_FILE)
@@ -478,7 +489,7 @@ def main() -> None:
 
     postcard, meme = get_picture(digest, "postcard"), get_picture(digest, "meme")
 
-    failed = False
+    failed_ids = []
     for chat_id, user in state["users"].items():
         name = user.get("name") or "друг"
         personal = (digest.get("personal") or {}).get(chat_id)
@@ -499,7 +510,7 @@ def main() -> None:
                 send_photo(chat_id, CARD_FILE)
             send(chat_id, text, html_mode=True)
         except Exception as e:
-            failed = True
+            failed_ids.append(chat_id)
             print(f"Подборка для {chat_id} не отправлена: {e}", file=sys.stderr)
             continue
         if meme:
@@ -507,8 +518,32 @@ def main() -> None:
                 send_photo(chat_id, *meme)
             except Exception as e:
                 print(f"Мем для {chat_id} не отправлен: {e}", file=sys.stderr)
-    if failed:
+    if not DRY_RUN and len(failed_ids) < len(state["users"]):  # хоть кому-то ушло — сегодня больше не шлём
+        state["delivered"] = today(CONFIG).isoformat()
+        save_state(state)
+    if failed_ids:
         sys.exit(1)
+
+
+def should_send(state: dict, digest: dict | None) -> bool:
+    """Решает по MODE, рассылать ли сейчас; объясняет решение в логе."""
+    if MODE == "force" or DRY_RUN:
+        return True
+    today_s = today(CONFIG).isoformat()
+    if state.get("delivered") == today_s:
+        print(f"[{MODE}] сегодня уже рассылали — пропускаем")
+        return False
+    if MODE == "morning" and not digest:
+        print("[morning] выпуска за сегодня ещё нет — ждём пуш от routine, крайний срок 10:00")
+        return False
+    if MODE == "push":
+        if not digest:
+            print("[push] в ветке нет выпуска за сегодня — пропускаем")
+            return False
+        if datetime.now(ZoneInfo(CONFIG["timezone"])).hour < SEND_AFTER_HOUR:
+            print(f"[push] выпуск готов, но ещё нет {SEND_AFTER_HOUR}:00 — разошлёт утренний запуск")
+            return False
+    return True
 
 
 if __name__ == "__main__":

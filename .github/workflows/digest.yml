@@ -3,8 +3,11 @@ name: Daily digest
 on:
   schedule:
     - cron: "30 2 * * *"  # 05:30 по Минску: только обработать входящие, чтобы routine видела свежий state.json
-    - cron: "0 5 * * *"   # 08:00 по Минску: рассылка
-  workflow_dispatch:
+    - cron: "0 5 * * *"   # 08:00 по Минску: рассылка, если routine уже положила выпуск
+    - cron: "0 7 * * *"   # 10:00 по Минску: крайний срок — если ещё ничего не ушло, шлём что есть
+  push:
+    branches: [claude/shared]  # routine запушила выпуск: после 08:00 и если сегодня ещё не слали — рассылаем
+  workflow_dispatch:           # вручную — рассылка всегда
 
 permissions:
   contents: write  # чтобы закоммитить state.json
@@ -17,8 +20,19 @@ jobs:
   digest:
     runs-on: ubuntu-latest
     timeout-minutes: 20  # до 10 минут ожидания имени
+    env:
+      # режим для digest.py; cron-выражения здесь и в on.schedule должны совпадать
+      MODE: >-
+        ${{ github.event_name == 'push' && 'push'
+          || github.event_name == 'workflow_dispatch' && 'force'
+          || github.event.schedule == '30 2 * * *' && 'sync'
+          || github.event.schedule == '0 5 * * *' && 'morning'
+          || 'deadline' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # push-запуск приходит из ветки claude/shared, но код и state.json всегда берём из основной
+          ref: ${{ github.event.repository.default_branch }}
 
       - uses: actions/setup-python@v5
         with:
@@ -28,8 +42,8 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Fetch digest texts
-        # тексты кладёт routine Claude Code в ветку claude/shared; нет их — уйдут приветствие, погода и курсы
-        if: github.event.schedule != '30 2 * * *'
+        # тексты кладёт routine Claude Code в ветку claude/shared; нет их — уйдёт урезанная подборка
+        if: env.MODE != 'sync'
         run: |
           (git fetch --depth 1 origin claude/shared && git show FETCH_HEAD:digest.json > digest.json) \
             || { rm -f digest.json; echo "digest.json в ветке claude/shared нет"; }
@@ -37,14 +51,13 @@ jobs:
 
       - name: Send digest
         env:
-          SYNC_ONLY: ${{ github.event.schedule == '30 2 * * *' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           INVITE_CODE: ${{ secrets.INVITE_CODE }}
         run: python digest.py
 
       - name: Save state.json
-        if: always()  # имя сохраняем, даже если подборка не собралась
+        if: always()  # имя и отметку о рассылке сохраняем, даже если подборка не собралась
         run: |
           [ -f state.json ] || exit 0
           git add state.json
