@@ -13,8 +13,8 @@
   TELEGRAM_CHAT_ID    (необязательно) chat_id, который подписан сразу, без приглашения
   MODE                (необязательно) когда и как рассылать; ставит workflow:
                         force    — разослать сейчас (ручной запуск, по умолчанию)
-                        sync     — только обработать входящие и выйти: ночной запуск перед routine,
-                                   чтобы она видела свежий state.json
+                        sync     — только обработать входящие и выйти: ежечасный запуск,
+                                   чтобы routine видела свежий state.json
                         morning  — 08:00: разослать, только если выпуск за сегодня уже готов
                         push     — routine запушила выпуск: разослать, если уже после 08:00 и сегодня не слали
                         deadline — 10:00: если сегодня ещё не слали — разослать что есть
@@ -111,8 +111,7 @@ def send(chat_id: str, text: str, html_mode: bool = False) -> None:
         return
     # лимит Telegram считается по тексту после разбора разметки — теги и адреса ссылок не в счёт
     for part in split_message(text, measure=(lambda t: len(strip_html(t))) if html_mode else len):
-        # ранний синхронизирующий запуск идёт ночью — отвечаем без звука
-        params = dict(chat_id=chat_id, disable_web_page_preview=True, disable_notification=SYNC_ONLY)
+        params = dict(chat_id=chat_id, disable_web_page_preview=True, disable_notification=quiet_hours())
         if not html_mode:
             tg("sendMessage", text=part, **params)
             continue
@@ -123,6 +122,12 @@ def send(chat_id: str, text: str, html_mode: bool = False) -> None:
                 raise
             print(f"HTML не разобрался, шлём без разметки: {e}", file=sys.stderr)
             tg("sendMessage", text=strip_html(part), **params)
+
+
+def quiet_hours() -> bool:
+    """Ночью (22:00–08:00 по Минску) ответы ежечасной синхронизации приходят без звука."""
+    hour = datetime.now(ZoneInfo(CONFIG["timezone"])).hour
+    return SYNC_ONLY and (hour >= 22 or hour < SEND_AFTER_HOUR)
 
 
 def strip_html(text: str) -> str:

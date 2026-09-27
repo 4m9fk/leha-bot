@@ -2,7 +2,8 @@ name: Daily digest
 
 on:
   schedule:
-    - cron: "30 2 * * *"  # 05:30 по Минску: только обработать входящие, чтобы routine видела свежий state.json
+    - cron: "17 * * * *"  # каждый час: только обработать входящие (подписки, имена, /interests) —
+                          # routine в 06:07 видит state.json на 05:17
     - cron: "0 5 * * *"   # 08:00 по Минску: рассылка, если routine уже положила выпуск
     - cron: "0 7 * * *"   # 10:00 по Минску: крайний срок — если ещё ничего не ушло, шлём что есть
   push:
@@ -25,7 +26,7 @@ jobs:
       MODE: >-
         ${{ github.event_name == 'push' && 'push'
           || github.event_name == 'workflow_dispatch' && 'force'
-          || github.event.schedule == '30 2 * * *' && 'sync'
+          || github.event.schedule == '17 * * * *' && 'sync'
           || github.event.schedule == '0 5 * * *' && 'morning'
           || 'deadline' }}
     steps:
