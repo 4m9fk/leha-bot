@@ -329,49 +329,109 @@ def rates_section(rates: list[dict]) -> str:
 # ---------- карточка-инфографика ----------
 
 # цвета — эталонная палитра dataviz (светлая тема); температура и дождь — два отдельных графика
-# с общей осью часов, а не один с двумя осями Y
-SURFACE, INK, INK_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e5e0"
+# с общей осью часов, а не один с двумя осями Y. Значки — из DejaVu Sans (☀☁☔❄⚡★), цветных эмодзи
+# matplotlib не рисует.
+INK, INK_2, GRID = "#0b0b0b", "#52514e", "#e6e5e0"
 TEMP_COLOR, RAIN_COLOR = "#eb6834", "#2a78d6"
+ACCENTS = ["#eb6834", "#2a78d6", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]  # категориальная палитра по порядку
+BG_TOP, BG_BOTTOM, PANEL = "#fff3d6", "#fde2ec", "#ffffffcc"
 
 
-def render_card(cfg: dict, h: dict | None, rates: list[dict], highlights: list[dict], path: Path) -> bool:
-    """Рисует PNG 1080×1350: заголовок, температура и дождь по часам, курсы, главное сегодня."""
+def weather_icon(h: dict) -> tuple[str, str]:
+    """Значок и цвет для «погоды дня» по часам 8–21."""
+    codes = [h["weather_code"][i] for i in range(8, 22)]
+    if any(c >= 95 for c in codes):
+        return "⚡", "#eda100"
+    if any(c in (71, 73, 75, 77, 85, 86) for c in codes):
+        return "❄", RAIN_COLOR
+    if rain_windows(h):
+        return "☔", RAIN_COLOR
+    if sum(c >= 3 for c in codes) > len(codes) / 2:
+        return "☁", "#8b8a86"
+    return "☀", "#eda100"
+
+
+def verdicts(h: dict) -> list[str]:
+    """Весёлые вердикты дня: зонт и одежда."""
+    t = h["temperature_2m"]
+    lo, hi = min(t[8:22]), max(t[8:22])
+    umbrella = "☂ Зонт: бери!" if rain_windows(h) else "☂ Зонт: пусть отдыхает"
+    if lo < 0:
+        wear = "Надеть: всё, что есть"
+    elif lo < 8:
+        wear = "Надеть: куртку и шапку"
+    elif lo < 14:
+        wear = "Надеть: куртку"
+    elif hi < 20:
+        wear = "Надеть: худи"
+    elif hi < 26:
+        wear = "Надеть: футболку + кофту"
+    else:
+        wear = "Надеть: минимум, SPF — максимум"
+    return [umbrella, wear]
+
+
+def render_card(cfg: dict, h: dict | None, rates: list[dict], highlights: list[dict], tagline: str,
+                path: Path) -> bool:
+    """Рисует PNG 1080×1350: приветствие, погода с вердиктами, температура и дождь по часам, курсы,
+    главное сегодня и девиз дня."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.patches import FancyBboxPatch
 
-    d = today(cfg)
-    fig = plt.figure(figsize=(7.2, 9), dpi=150, facecolor=SURFACE)
     plt.rcParams.update({"font.family": "DejaVu Sans"})  # встроен в matplotlib, есть кириллица
-    fig.text(0.07, 0.945, cfg["city"], fontsize=26, fontweight="bold", color=INK, va="top")
-    fig.text(0.07, 0.895, f"{WEEKDAYS[d.weekday()].capitalize()}, {d.day} {MONTHS[d.month - 1]}",
-             fontsize=13, color=INK_2, va="top")
+    d = today(cfg)
+    fig = plt.figure(figsize=(7.2, 9), dpi=150)
+    bg = fig.add_axes([0, 0, 1, 1], zorder=-10)
+    bg.imshow([[0], [1]], cmap=LinearSegmentedColormap.from_list("bg", [BG_TOP, BG_BOTTOM]),
+              aspect="auto", extent=(0, 1, 0, 1), interpolation="bicubic")
+    bg.axis("off")
 
-    top = 0.84
+    def panel(x, y, w, hgt, color=PANEL, radius=0.018):
+        # zorder ниже осей: подложки не должны перекрывать графики
+        fig.patches.append(FancyBboxPatch((x, y), w, hgt, boxstyle=f"round,pad=0,rounding_size={radius}",
+                                          transform=fig.transFigure, facecolor=color, edgecolor="none",
+                                          zorder=-5))
+
+    fig.text(0.07, 0.955, f"Доброе утро, {cfg['city']}!", fontsize=22, fontweight="bold", color=INK, va="top")
+    fig.text(0.07, 0.912, f"{WEEKDAYS[d.weekday()].capitalize()}, {d.day} {MONTHS[d.month - 1]}",
+             fontsize=12, color=INK_2, va="top")
+
     if h:
         hours = list(range(6, 24))
         temps = [h["temperature_2m"][i] for i in hours]
         rain = [h["precipitation_probability"][i] for i in hours]
         lo, hi = min(temps), max(temps)
-        fig.text(0.07, top, f"{lo:.0f}° … {hi:.0f}°", fontsize=30, fontweight="bold", color=INK, va="top")
+        icon, icon_color = weather_icon(h)
+        panel(0.05, 0.395, 0.9, 0.475)
+        fig.text(0.09, 0.855, icon, fontsize=58, color=icon_color, va="top")
+        fig.text(0.29, 0.852, f"{lo:.0f}° … {hi:.0f}°", fontsize=32, fontweight="bold", color=INK, va="top")
         windows = rain_windows(h)
-        fig.text(0.07, top - 0.06, shorten("Осадки: " + "; ".join(windows), 70) if windows else "Без осадков",
-                 fontsize=11, color=INK_2, va="top")
+        fig.text(0.29, 0.793, shorten("Осадки: " + "; ".join(windows), 48) if windows else "Без осадков",
+                 fontsize=10, color=INK_2, va="top")
+        for k, text in enumerate(verdicts(h)):  # плашки-вердикты
+            x = 0.09 + k * 0.42
+            panel(x, 0.715, 0.4, 0.045, color=ACCENTS[1 + k] + "26")
+            fig.text(x + 0.02, 0.7375, text, fontsize=11, fontweight="bold", color=INK, va="center")
 
-        ax_t = fig.add_axes([0.1, 0.56, 0.84, 0.15], facecolor=SURFACE)
-        ax_r = fig.add_axes([0.1, 0.45, 0.84, 0.08], facecolor=SURFACE, sharex=ax_t)
-        ax_t.plot(hours, temps, color=TEMP_COLOR, linewidth=2)
+        ax_t = fig.add_axes([0.12, 0.535, 0.78, 0.13])
+        ax_r = fig.add_axes([0.12, 0.43, 0.78, 0.06], sharex=ax_t)
+        ax_t.plot(hours, temps, color=TEMP_COLOR, linewidth=2.2)
+        ax_t.fill_between(hours, temps, lo - 2, color=TEMP_COLOR, alpha=0.15, linewidth=0)
         for i in (temps.index(lo), temps.index(hi)):  # подписываем только минимум и максимум
             ax_t.annotate(f"{temps[i]:.0f}°", (hours[i], temps[i]), textcoords="offset points",
-                          xytext=(0, 7), ha="center", fontsize=10, color=INK)
+                          xytext=(0, 7), ha="center", fontsize=10, fontweight="bold", color=INK)
         ax_t.set_ylim(lo - 2, hi + 3)
-        ax_t.set_title("Температура, °C", loc="left", fontsize=10, color=INK_2, pad=4)
+        ax_t.set_title("Температура, °C", loc="left", fontsize=9, color=INK_2, pad=3)
         ax_r.bar(hours, rain, width=0.7, color=RAIN_COLOR)
         ax_r.set_ylim(0, 100)
         ax_r.set_yticks([0, 50, 100])
-        ax_r.set_title("Вероятность дождя, %", loc="left", fontsize=10, color=INK_2, pad=4)
+        ax_r.set_title("Вероятность дождя, %", loc="left", fontsize=9, color=INK_2, pad=3)
         ax_r.set_xticks(range(6, 24, 3), [f"{x}:00" for x in range(6, 24, 3)])
         for ax in (ax_t, ax_r):
+            ax.set_facecolor("none")
             ax.tick_params(colors=INK_2, labelsize=8, length=0)
             ax.grid(axis="y", color=GRID, linewidth=0.8)
             ax.set_axisbelow(True)
@@ -380,31 +440,37 @@ def render_card(cfg: dict, h: dict | None, rates: list[dict], highlights: list[d
             ax.spines["bottom"].set_color(GRID)
         plt.setp(ax_t.get_xticklabels(), visible=False)
 
-    if rates:  # плашки с курсами
-        fig.text(0.07, 0.395, "Курсы НБРБ, BYN", fontsize=10, color=INK_2, va="top")
-        w = 0.86 / len(rates)
+    if rates:  # плашки с курсами, у каждой своя полоска-акцент
+        fig.text(0.07, 0.372, "Курсы НБРБ, BYN", fontsize=10, color=INK_2, va="top")
+        w = 0.9 / len(rates)
         for k, r in enumerate(rates):
-            x = 0.07 + k * w
-            fig.patches.append(matplotlib.patches.FancyBboxPatch(
-                (x, 0.295), w - 0.02, 0.085, boxstyle="round,pad=0,rounding_size=0.012",
-                transform=fig.transFigure, facecolor="#f1f0ec", edgecolor="none"))
+            x = 0.05 + k * w
+            panel(x, 0.265, w - 0.02, 0.085)
+            panel(x + 0.018, 0.338, w - 0.056, 0.006, color=ACCENTS[k], radius=0.003)
             label = r["code"] if r["scale"] == 1 else f"{r['scale']} {r['code']}"
-            fig.text(x + 0.02, 0.365, label, fontsize=10, color=INK_2, va="top")
+            fig.text(x + 0.025, 0.33, label, fontsize=10, color=INK_2, va="top")
             arrow = "" if not r["delta"] else (" ▲" if r["delta"] > 0 else " ▼")
-            fig.text(x + 0.02, 0.335, f"{r['rate']:.4f}{arrow}", fontsize=15, fontweight="bold",
+            fig.text(x + 0.025, 0.303, f"{r['rate']:.4f}{arrow}", fontsize=15, fontweight="bold",
                      color=INK, va="top")
 
-    if highlights:  # главное сегодня — из digest.json
-        fig.text(0.07, 0.255, "Сегодня стоит", fontsize=10, color=INK_2, va="top")
-        y = 0.225
-        for item in highlights[:3]:
-            fig.text(0.07, y, shorten(str(item.get("title", "")), 38), fontsize=13, fontweight="bold",
+    if highlights:  # главное сегодня — из digest.json, с цветными номерами
+        fig.text(0.07, 0.24, "Сегодня стоит", fontsize=10, color=INK_2, va="top")
+        y = 0.212
+        for k, item in enumerate(highlights[:3]):
+            fig.text(0.075, y - 0.001, "●", fontsize=22, color=ACCENTS[k], va="top")
+            fig.text(0.0885, y - 0.0115, str(k + 1), fontsize=10, fontweight="bold", color="white",
+                     va="top", ha="center")
+            fig.text(0.13, y, shorten(str(item.get("title", "")), 36), fontsize=12, fontweight="bold",
                      color=INK, va="top")
-            meta = " · ".join(str(item[k]) for k in ("when", "where") if item.get(k))
-            fig.text(0.07, y - 0.03, shorten(meta, 60), fontsize=10, color=INK_2, va="top")
-            y -= 0.07
+            meta = " · ".join(str(item[key]) for key in ("when", "where") if item.get(key))
+            fig.text(0.13, y - 0.027, shorten(meta, 56), fontsize=9.5, color=INK_2, va="top")
+            y -= 0.058
 
-    fig.savefig(path, facecolor=SURFACE)
+    if tagline:  # девиз дня от routine
+        fig.text(0.5, 0.018, f"★ {shorten(tagline, 60)} ★", fontsize=11, fontstyle="italic",
+                 color=ACCENTS[5], ha="center", va="bottom")
+
+    fig.savefig(path)
     plt.close(fig)
     return True
 
@@ -480,7 +546,8 @@ def main() -> None:
     digest = digest or {}
     hourly, rates = get_hourly(CONFIG), get_rates()
     try:
-        card = render_card(CONFIG, hourly, rates, digest.get("highlights") or [], CARD_FILE)
+        card = render_card(CONFIG, hourly, rates, digest.get("highlights") or [],
+                           str(digest.get("card_tagline") or ""), CARD_FILE)
     except Exception as e:  # карточка — бонус, без неё подборка всё равно уходит
         print(f"Карточку нарисовать не удалось: {e}", file=sys.stderr)
         card = False
