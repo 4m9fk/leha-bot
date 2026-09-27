@@ -14,10 +14,14 @@
 
 import json
 import os
+import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from html import unescape
 from pathlib import Path
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -29,6 +33,13 @@ STATE_FILE = ROOT / "state.json"
 TG_LIMIT = 4000  # у Telegram лимит 4096 символов на сообщение
 DRY_RUN = bool(os.getenv("DRY_RUN"))
 INVITE_CODE = os.getenv("INVITE_CODE", "").strip()
+IMAGES_MARKER = "===IMAGES==="  # после него Claude перечисляет страницы для альбома афиш
+MAX_IMAGES = 10  # максимум фото в одном альбоме Telegram
+PHOTO_TYPES = ("image/jpeg", "image/png")
+PHOTO_MAX_BYTES = 10_000_000
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; digest-bot/1.0)"}
+OG_IMAGE_TAG = re.compile(r"<meta[^>]+(?:property|name)=[\"'](?:og:image|twitter:image)[\"'][^>]*>", re.I)
+CONTENT_ATTR = re.compile(r"content=[\"']([^\"']+)[\"']", re.I)
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 WMO = {0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность", 3: "пасмурно",
@@ -62,10 +73,12 @@ def save_state(state: dict) -> None:
 
 # ---------- Telegram ----------
 
-def tg(method: str, **params) -> dict:
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    r = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=params,
-                      timeout=params.get("timeout", 0) + 30)
+def tg(method: str, files: dict | None = None, **params) -> dict:
+    url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{method}"
+    if files:  # загрузка файлов — multipart, вложенные объекты в params уже строками JSON
+        r = requests.post(url, data=params, files=files, timeout=120)
+    else:
+        r = requests.post(url, json=params, timeout=params.get("timeout", 0) + 30)
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram {method}: {data}")
@@ -78,6 +91,23 @@ def send(chat_id: str, text: str) -> None:
         return
     for part in split_message(text):
         tg("sendMessage", chat_id=chat_id, text=part, disable_web_page_preview=True)
+
+
+def send_photos(chat_id: str, photos: list[tuple[str, str, bytes]]) -> None:
+    """photos: (подпись, URL картинки, содержимое). Картинки загружаем сами,
+    чтобы не зависеть от того, пустит ли сайт серверы Telegram."""
+    if DRY_RUN:
+        for caption, url, _ in photos:
+            print(f"🖼 {caption}\n   {url}")
+        return
+    if len(photos) == 1:
+        caption, _, data = photos[0]
+        tg("sendPhoto", files={"photo": data}, chat_id=chat_id, caption=caption[:1024])
+        return
+    media = [{"type": "photo", "media": f"attach://p{i}", "caption": caption[:1024]}
+             for i, (caption, _, _) in enumerate(photos)]
+    tg("sendMediaGroup", files={f"p{i}": data for i, (_, _, data) in enumerate(photos)},
+       chat_id=chat_id, media=json.dumps(media, ensure_ascii=False))
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -189,6 +219,47 @@ def get_weather(cfg: dict) -> str:
         return f"(данные о погоде получить не удалось: {e} — найди прогноз через веб-поиск)"
 
 
+# ---------- афиши (og:image со страниц, найденных Claude) ----------
+
+def split_images(text: str) -> tuple[str, list[dict]]:
+    """Отделяет от подборки JSON-список страниц для альбома после IMAGES_MARKER."""
+    body, _, tail = text.partition(IMAGES_MARKER)
+    try:
+        items = json.loads(tail[tail.index("["):tail.rindex("]") + 1])
+    except ValueError:  # маркера нет или JSON битый — просто без картинок
+        items = []
+    items = [i for i in items if isinstance(i, dict) and str(i.get("url", "")).startswith("http")]
+    return body.strip(), items
+
+
+def find_image(page_url: str) -> tuple[str, bytes] | None:
+    """Скачивает обложку страницы (og:image / twitter:image), если это подходящая картинка."""
+    try:
+        html = requests.get(page_url, headers=HTTP_HEADERS, timeout=15).text
+        for tag in OG_IMAGE_TAG.findall(html):
+            if not (m := CONTENT_ATTR.search(tag)):
+                continue
+            img_url = urljoin(page_url, unescape(m.group(1)))
+            r = requests.get(img_url, headers=HTTP_HEADERS, timeout=15)
+            if (r.ok and r.headers.get("content-type", "").split(";")[0] in PHOTO_TYPES
+                    and len(r.content) <= PHOTO_MAX_BYTES):
+                return img_url, r.content
+    except requests.RequestException:
+        pass
+    return None
+
+
+def collect_photos(items: list[dict]) -> list[tuple[str, str, bytes]]:
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        found = pool.map(find_image, [i["url"] for i in items])
+    photos, seen = [], set()
+    for item, image in zip(items, found):
+        if image and image[0] not in seen:
+            seen.add(image[0])
+            photos.append((str(item.get("title", "")), *image))
+    return photos[:MAX_IMAGES]
+
+
 # ---------- подборка ----------
 
 def build_prompt(cfg: dict, name: str, weather: str) -> str:
@@ -211,7 +282,13 @@ def build_prompt(cfg: dict, name: str, weather: str) -> str:
   пункты через «•», ссылки — просто URL на отдельной строке.
 - Если по разделу ничего стоящего не нашлось — так и напиши одной строкой.
 - Род в комплименте и обращениях определи по имени; если непонятно — используй нейтральные формулировки.
-- Выведи только саму подборку, без комментариев о поиске."""
+- Выведи только саму подборку, без комментариев о поиске.
+
+После подборки выведи строку {IMAGES_MARKER} и сразу за ней JSON-массив (до {MAX_IMAGES} элементов)
+для альбома афиш — по одному элементу на фильм и мероприятие из подборки, в том же порядке:
+[{{"title": "🎬 Название — где и когда", "url": "https://..."}}]
+url — страница именно этого фильма или события из результатов поиска (не главная сайта и не общий список),
+на такой странице обычно есть афиша. Не выдумывай адреса; если подходящей страницы нет — пропусти пункт."""
 
 
 def generate_digest(cfg: dict, name: str) -> str:
@@ -248,7 +325,8 @@ def main() -> None:
     failed = False
     for chat_id, user in state["users"].items():
         try:
-            send(chat_id, generate_digest(CONFIG, user.get("name") or "друг"))
+            digest, image_pages = split_images(generate_digest(CONFIG, user.get("name") or "друг"))
+            send(chat_id, digest)
         except Exception as e:
             if DRY_RUN:
                 raise
@@ -258,6 +336,12 @@ def main() -> None:
                 send(chat_id, f"⚠️ Не удалось собрать подборку: {e}")
             except Exception:
                 pass  # например, пользователь заблокировал бота
+            continue
+        try:  # картинки — бонус: без них подборка всё равно считается доставленной
+            if photos := collect_photos(image_pages):
+                send_photos(chat_id, photos)
+        except Exception as e:
+            print(f"Афиши для {chat_id} не отправлены: {e}", file=sys.stderr)
     if failed:
         sys.exit(1)
 
