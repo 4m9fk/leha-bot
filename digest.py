@@ -203,15 +203,29 @@ def get_weather(cfg: dict) -> str:
 
 
 # ---------- подборка ----------
+# Общая часть (погода, новости, афиша — с веб-поиском) собирается ОДИН раз на всех получателей,
+# личная (приветствие, шутка, комплимент по имени) — дешёвым запросом без поиска на каждого.
 
-def build_prompt(cfg: dict, name: str, weather: str) -> str:
+FORMAT_RULES = """- Формат — простой текст для Telegram, БЕЗ Markdown (никаких *, #, **). Заголовки разделов с эмодзи,
+  пункты через «•», ссылки — просто URL на отдельной строке."""
+
+
+def today_line(cfg: dict) -> str:
     today = datetime.now(ZoneInfo(cfg["timezone"]))
-    sections = "\n".join(f"{i}. {s}" for i, s in enumerate(cfg["sections"], 1))
-    return f"""Ты — тёплый и остроумный утренний бот. Сегодня {today:%d.%m.%Y} ({WEEKDAYS[today.weekday()]}).
-Получателя зовут {name}. Начни с приветствия по имени и дальше пиши подборку на языке: {cfg['language']}.
+    return f"Сегодня {today:%d.%m.%Y} ({WEEKDAYS[today.weekday()]})."
+
+
+def numbered(sections: list[str]) -> str:
+    return "\n".join(f"{i}. {s}" for i, s in enumerate(sections, 1))
+
+
+def build_shared_prompt(cfg: dict, weather: str) -> str:
+    return f"""Ты — утренний бот, собираешь подборку по городу {cfg['city']}. {today_line(cfg)}
+Язык: {cfg['language']}. Эту часть получат несколько человек, поэтому без приветствия и обращений по имени —
+начни сразу с первого раздела.
 
 Разделы строго в таком порядке:
-{sections}
+{numbered(cfg['sections'])}
 
 Данные о погоде в городе {cfg['city']} (Open-Meteo):
 {weather}
@@ -220,43 +234,83 @@ def build_prompt(cfg: dict, name: str, weather: str) -> str:
 - Для новостей и мероприятий обязательно используй веб-поиск (местные сайты, афиши, соцсети города).
   Опирайся только на найденное, ничего не выдумывай. Если мероприятий мало — лучше меньше, но настоящие.
 - Каждая новость: 1–2 предложения сути + ссылка на источник.
-- Формат — простой текст для Telegram, БЕЗ Markdown (никаких *, #, **). Заголовки разделов с эмодзи,
-  пункты через «•», ссылки — просто URL на отдельной строке.
+{FORMAT_RULES}
 - Если по разделу ничего стоящего не нашлось — так и напиши одной строкой.
-- Род в комплименте и обращениях определи по имени; если непонятно — используй нейтральные формулировки.
-- Выведи только саму подборку, без комментариев о поиске."""
+- Выведи только сами разделы, без комментариев о поиске."""
 
 
-def generate_digest(cfg: dict, name: str) -> str:
+def build_personal_prompt(cfg: dict, name: str, shared: str) -> str:
+    return f"""Ты — тёплый и остроумный утренний бот. {today_line(cfg)} Язык: {cfg['language']}.
+Получателя зовут {name}. Он получит утреннюю подборку, её общая часть уже готова:
+
+<общая_часть>
+{shared}
+</общая_часть>
+
+Напиши две личные части, которые встанут до и после общей:
+- intro: короткое приветствие по имени, затем разделы:
+{numbered(cfg['intro_sections'])}
+- outro: разделы:
+{numbered(cfg['outro_sections'])}
+
+Правила:
+{FORMAT_RULES}
+- Не повторяй общую часть, но можешь на неё ссылаться (например, обыграть погоду или новость).
+- Род в обращениях и комплименте определи по имени; если непонятно — используй нейтральные формулировки."""
+
+
+def ask_claude(cfg: dict, prompt: str, label: str, **kwargs) -> str:
+    """Запрос к Claude. Длинный поиск приходит кусками с stop_reason=pause_turn: продолжаем,
+    склеиваем текст всех кусков и логируем суммарный расход (он и определяет цену)."""
     client = anthropic.Anthropic()
-    messages = [{"role": "user", "content": build_prompt(cfg, name, get_weather(cfg))}]
-    location = {"type": "approximate", "city": cfg["city"], "timezone": cfg["timezone"]}
-    if cfg.get("country"):  # веб-поиск поддерживает не все страны (например, BY — нет)
-        location["country"] = cfg["country"]
-    tools = [{
-        "type": "web_search_20250305",
-        "name": "web_search",
-        "max_uses": cfg["max_searches"],
-        "user_location": location,
-    }]
-    # длинный поиск приходит кусками с stop_reason=pause_turn: продолжаем и собираем текст всех кусков
-    texts = []
+    messages = [{"role": "user", "content": prompt}]
+    texts, input_tokens, output_tokens, searches, chunks = [], 0, 0, 0, 0
     for _ in range(10):
-        resp = client.messages.create(model=cfg["model"], max_tokens=16000,
-                                      messages=messages, tools=tools)
+        chunks += 1
+        resp = client.messages.create(model=cfg["model"], max_tokens=16000, messages=messages, **kwargs)
         texts += [b.text for b in resp.content if b.type == "text"]
+        input_tokens += resp.usage.input_tokens
+        output_tokens += resp.usage.output_tokens
+        if resp.usage.server_tool_use:
+            searches += resp.usage.server_tool_use.web_search_requests or 0
         if resp.stop_reason != "pause_turn":
             break
         messages.append({"role": "assistant", "content": resp.content})
 
-    print(f"Claude: stop_reason={resp.stop_reason}, output_tokens={resp.usage.output_tokens}")
+    print(f"Claude [{label}]: stop_reason={resp.stop_reason}, input_tokens={input_tokens}, "
+          f"output_tokens={output_tokens}, web_searches={searches}, chunks={chunks}")
     if resp.stop_reason in ("max_tokens", "pause_turn"):
-        print(f"⚠️ Ответ Claude неполный (stop_reason={resp.stop_reason}) — конец подборки мог обрезаться",
+        print(f"⚠️ Ответ Claude [{label}] неполный (stop_reason={resp.stop_reason}) — конец мог обрезаться",
               file=sys.stderr)
     text = "".join(texts).strip()
     if not text:
-        raise RuntimeError(f"Пустой ответ от Claude (stop_reason={resp.stop_reason})")
+        raise RuntimeError(f"Пустой ответ от Claude [{label}] (stop_reason={resp.stop_reason})")
     return text
+
+
+def generate_shared(cfg: dict) -> str:
+    location = {"type": "approximate", "city": cfg["city"], "timezone": cfg["timezone"]}
+    if cfg.get("country"):  # веб-поиск поддерживает не все страны (например, BY — нет)
+        location["country"] = cfg["country"]
+    tools = [{
+        "type": "web_search_20260209",  # с динамической фильтрацией: в контекст идёт меньше лишнего
+        "name": "web_search",
+        "max_uses": cfg["max_searches"],
+        "user_location": location,
+    }]
+    return ask_claude(cfg, build_shared_prompt(cfg, get_weather(cfg)), "общая часть", tools=tools)
+
+
+def generate_personal(cfg: dict, name: str, shared: str) -> tuple[str, str]:
+    text = ask_claude(cfg, build_personal_prompt(cfg, name, shared), f"личная часть: {name}",
+                      output_config={"format": {"type": "json_schema", "schema": {
+                          "type": "object",
+                          "properties": {"intro": {"type": "string"}, "outro": {"type": "string"}},
+                          "required": ["intro", "outro"],
+                          "additionalProperties": False,
+                      }}})
+    parts = json.loads(text)
+    return parts["intro"].strip(), parts["outro"].strip()
 
 
 def main() -> None:
@@ -265,19 +319,35 @@ def main() -> None:
     if not state["users"]:
         print("Получателей нет: открой ссылку-приглашение и нажми Start.")
         return
-    failed = False
-    for chat_id, user in state["users"].items():
-        try:
-            send(chat_id, generate_digest(CONFIG, user.get("name") or "друг"))
-        except Exception as e:
-            if DRY_RUN:
-                raise
-            failed = True
-            print(f"Подборка для {chat_id} не отправлена: {e}", file=sys.stderr)
+
+    try:
+        shared = generate_shared(CONFIG)
+    except Exception as e:
+        if DRY_RUN:
+            raise
+        print(f"Общая часть подборки не собрана: {e}", file=sys.stderr)
+        for chat_id in state["users"]:
             try:
                 send(chat_id, f"⚠️ Не удалось собрать подборку: {e}")
             except Exception:
                 pass  # например, пользователь заблокировал бота
+        sys.exit(1)
+
+    failed = False
+    for chat_id, user in state["users"].items():
+        name = user.get("name") or "друг"
+        try:
+            intro, outro = generate_personal(CONFIG, name, shared)
+        except Exception as e:
+            if DRY_RUN:
+                raise
+            print(f"Личная часть для {chat_id} не собрана, шлём без неё: {e}", file=sys.stderr)
+            intro, outro = f"Доброе утро, {name}! ☀️", ""
+        try:
+            send(chat_id, "\n\n".join(p for p in (intro, shared, outro) if p))
+        except Exception as e:
+            failed = True
+            print(f"Подборка для {chat_id} не отправлена: {e}", file=sys.stderr)
     if failed:
         sys.exit(1)
 
