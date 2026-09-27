@@ -80,13 +80,16 @@ def render_slide(seg: dict, idx: int, total: int, header: str, pictures: dict[st
     if picture and picture.exists():  # сюжет с картинкой: картинка сверху, текст ниже
         img = mpimg.imread(str(picture))
         ih, iw = img.shape[:2]
-        box_w, box_h = 0.88, 0.40
+        box_w, box_h = 0.88, 0.50  # картинка занимает 0.40–0.90 высоты кадра
         scale = min(box_w * W / iw, box_h * H / ih)
         pw, ph = iw * scale / W, ih * scale / H
-        ax = fig.add_axes([0.5 - pw / 2, 0.5 + (box_h - ph) / 2, pw, ph])
+        ax = fig.add_axes([0.5 - pw / 2, 0.4 + (box_h - ph) / 2, pw, ph])
         ax.imshow(img)
         ax.axis("off")
-        text_top, title_size, wrap = 0.465, 30, 22
+        if seg.get("image_credit"):  # подпись источника реального фото
+            fig.text(0.5 + pw / 2, 0.4 + (box_h - ph) / 2 - 0.006, f"Фото: {seg['image_credit']}",
+                     fontsize=12, color=INK_2, ha="right", va="top")
+        text_top, title_size, wrap = 0.345, 32, 21
     else:  # только текст: крупный полупрозрачный номер сюжета сверху, текст ближе к центру
         fig.text(0.04, 0.9, f"{idx + 1:02d}", fontsize=190, fontweight="bold", color=accent, alpha=0.18,
                  va="top")
@@ -123,7 +126,7 @@ def weather_segment(h: dict, rain_windows) -> dict:
 
 def make_video(segments: list[dict], header: str, ticker: str, pictures: dict[str, Path],
                workdir: Path, out: Path) -> Path:
-    """Собирает ролик. segments: [{rubric, title, lead, voice, image?}], image ∈ ключи pictures."""
+    """Собирает ролик. segments: [{rubric, title, lead, voice, image?, image_credit?}], image ∈ ключи pictures."""
     workdir.mkdir(parents=True, exist_ok=True)
     clips = []
     for i, seg in enumerate(segments):

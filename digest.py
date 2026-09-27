@@ -570,6 +570,15 @@ def build_news_video(digest: dict, hourly: dict | None, card: bool, meme: tuple[
         pictures = {"card": CARD_FILE} if card else {}
         if meme:
             pictures["meme"] = meme[0]
+        for n, seg in enumerate(segments):  # реальные фото к сюжетам: файл из shots/ ветки или по image_url
+            key = str(seg.get("image") or "")
+            if not key or key in pictures:
+                continue
+            path = ROOT / key
+            if not (key.startswith("shots/") and path.is_file() and ROOT.resolve() in path.resolve().parents):
+                path = download_image(str(seg.get("image_url", "")), ROOT / "shots" / f"dl{n}", f"кадр {n}")
+            if path:
+                pictures[key or f"dl{n}"] = path
         ticker = "  •  ".join(str(s.get("title", "")) for s in segments if s.get("title")) + "  •  "
         path = video.make_video(segments, f"{CONFIG['city'].upper()} · УТРО", ticker, pictures,
                                 ROOT / "video_work", VIDEO_FILE)

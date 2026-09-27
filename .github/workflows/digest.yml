@@ -56,6 +56,7 @@ jobs:
             || { rm -f digest.json; echo "digest.json в ветке claude/shared нет"; }
           for f in postcard.jpg postcard.png meme.jpg meme.png; do git show "FETCH_HEAD:$f" > "$f" 2>/dev/null || rm -f "$f"; done
           git archive FETCH_HEAD album 2>/dev/null | tar -x || echo "личных альбомов нет"
+          git archive FETCH_HEAD shots 2>/dev/null | tar -x || echo "фото к сюжетам нет"
 
       - name: Send digest
         env:
