@@ -533,8 +533,11 @@ def should_send(state: dict, digest: dict | None) -> bool:
         return True
     today_s = today(CONFIG).isoformat()
     if state.get("delivered") == today_s:
-        print(f"[{MODE}] сегодня уже рассылали — пропускаем")
-        return False
+        # allow_resend — только для пуша routine (тесты перезапуском); 08:00 и 10:00 дублей не шлют
+        if not (CONFIG.get("allow_resend") and MODE == "push"):
+            print(f"[{MODE}] сегодня уже рассылали — пропускаем")
+            return False
+        print(f"[{MODE}] сегодня уже рассылали, но allow_resend включён — шлём ещё раз")
     if MODE == "morning" and not digest:
         print("[morning] выпуска за сегодня ещё нет — ждём пуш от routine, крайний срок 10:00")
         return False
