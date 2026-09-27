@@ -6,8 +6,13 @@
 
 **Знакомство.** При первом запуске бот спросит, как тебя зовут, и подождёт ответа 10 минут.
 Поэтому первый раз запускай вручную (Run workflow) и держи Telegram под рукой.
-Имя сохраняется в `state.json` в репозитории. Сменить имя можно, написав боту `/name Новое имя`:
+Получатели и их имена сохраняются в `state.json` в репозитории. Сменить имя можно, написав боту `/name Новое имя`:
 оно подхватится при следующем запуске (Telegram хранит сообщения для бота 24 часа).
+
+**Несколько получателей.** Подписаться может любой, у кого есть ссылка-приглашение
+`https://t.me/<имя_бота>?start=<INVITE_CODE>`: открыть её и нажать **Start**. Имя бот спросит при следующем
+запуске — чтобы не ждать утра, запусти workflow вручную. Без ссылки бот посторонним ничего не присылает.
+Каждый получатель — отдельная подборка, так что стоимость растёт пропорционально.
 
 Погода берётся из бесплатного Open-Meteo (ключ не нужен), новости и афиша — через веб-поиск Claude.
 
@@ -18,13 +23,16 @@
 2. Сохрани токен вида `123456789:AAH...`.
 3. Открой своего бота и нажми **Start** (или напиши ему что угодно) — иначе он не сможет тебе писать.
 
-### 2. Узнай свой chat_id
-Открой в браузере (подставь токен):
+### 2. Придумай код приглашения
+Любая строка из латиницы, цифр, `_` и `-` (до 64 символов), например:
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(12))"
 ```
-https://api.telegram.org/bot<ТОКЕН>/getUpdates
-```
-Найди `"chat":{"id":123456789` — это число и есть `TELEGRAM_CHAT_ID`.
-(Если там пусто — ещё раз напиши боту и обнови страницу.)
+Это `INVITE_CODE`. Ссылка-приглашение: `https://t.me/<имя_бота>?start=<INVITE_CODE>` — открой её сам
+и отправь тем, кому нужна подборка.
+
+(Необязательно: вместо ссылки можно указать свой chat_id в `TELEGRAM_CHAT_ID` — его видно по адресу
+`https://api.telegram.org/bot<ТОКЕН>/getUpdates` в `"chat":{"id":...`, после того как напишешь боту.)
 
 ### 3. Получи ключ Claude API
 [console.anthropic.com](https://console.anthropic.com) → Settings → API Keys → Create Key.
@@ -33,10 +41,11 @@ https://api.telegram.org/bot<ТОКЕН>/getUpdates
 
 ### 4. Залей код на GitHub
 1. Создай **приватный** репозиторий, загрузи туда все файлы (включая папку `.github`).
-2. Settings → Secrets and variables → Actions → **New repository secret**, добавь три секрета:
+2. Settings → Secrets and variables → Actions → **New repository secret**, добавь секреты:
    - `ANTHROPIC_API_KEY`
    - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
+   - `INVITE_CODE`
+   - `TELEGRAM_CHAT_ID` (необязательно)
 
 ### 5. Проверь
 Вкладка **Actions** → *Daily digest* → **Run workflow**. Через 1–3 минуты придёт сообщение.
@@ -57,9 +66,9 @@ https://api.telegram.org/bot<ТОКЕН>/getUpdates
 ## Локальный запуск
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=... TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
+export ANTHROPIC_API_KEY=... TELEGRAM_BOT_TOKEN=... INVITE_CODE=...
 DRY_RUN=1 python digest.py   # только напечатать
-python digest.py             # отправить в Telegram
+python digest.py             # отправить в Telegram всем получателям
 ```
 
 ## Если что-то не так
@@ -67,4 +76,6 @@ python digest.py             # отправить в Telegram
   [документации](https://docs.claude.com/en/docs/agents-and-tools/tool-use/web-search-tool) и поправь в коде/конфиге.
 - **Веб-поиск запрещён** — его может понадобиться включить в Console (Settings → Privacy/Features).
 - **`chat not found`** — ты не нажал Start у бота, или неверный chat_id.
+- **Бот не отвечает на ссылку** — проверь, что код в ссылке совпадает с секретом `INVITE_CODE`,
+  и что после нажатия Start прошёл запуск workflow.
 - При сбое бот сам пришлёт тебе сообщение «⚠️ Не удалось собрать подборку…».
